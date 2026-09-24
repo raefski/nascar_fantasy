@@ -1,0 +1,259 @@
+"""Free NFL spreads + totals for pick'em — no Odds API credits.
+
+Reads DraftKings and FanDuel from their own public endpoints (the same ones
+edge/arb uses) and re-shapes the result into the Odds API's event dicts, so
+edge.pickem_live._parse_events, the book weighting and everything downstream
+stay untouched.
+
+HOW THIS DIFFERS FROM THE PAID PATH, honestly
+edge/pickem_live.py builds its consensus from ~10 books for 2 credits a call.
+This gets 2 (DraftKings, FanDuel), because those are the endpoints that
+answer without a key. The model's own reasoning is that averaging cancels
+book-specific noise, so a 2-book mean is a weaker reading of "the market"
+than a 10-book one -- most of the gain from averaging arrives by about the
+third or fourth book.
+
+Both are provided rather than one replacing the other: use `compare()` to see
+how far apart they actually are on a real slate before deciding. If the gap
+is small relative to the 0.5-point move the model cares about, the free path
+is enough.
+
+Fanatics can be added as a third book once its Oddschecker league id is
+known; NFL is not listed there until the season opens.
+
+The DraftKings call here shares both its client and its host
+(sportsbook-nash.draftkings.com) with edge/arb, and this runs from the same
+residential machine -- see DRAFTKINGS_ACCESS.md before scheduling a capture
+close to a heavy arb scan, or before adding calls here.
+"""
+from __future__ import annotations
+
+import logging
+from datetime import datetime, timedelta, timezone
+
+from edge.arb.config import ArbConfig
+from edge.arb.draftkings_league import DraftKingsLeague
+from edge.arb.fanduel import FanDuelScrape
+from edge.arb.models import Board
+from edge.pickem_live import LiveGame, _parse_events
+
+log = logging.getLogger("edge.pickem_free")
+
+SPORT_KEY = "americanfootball_nfl"
+
+
+def _main_line(points: dict[float, dict[str, float]]) -> float | None:
+    """Pick a book's *main* line out of an alternate ladder.
+
+    The main line is the one priced closest to even on both sides; alternates
+    are deliberately lopsided. Without this, a -8.5 alt would be as likely to
+    be chosen as the -3 the market is actually on.
+    """
+    best, best_gap = None, None
+    for point, sides in points.items():
+        if len(sides) < 2:
+            continue
+        gap = abs(max(sides.values()) - min(sides.values()))
+        if best_gap is None or gap < best_gap:
+            best, best_gap = point, gap
+    if best is None and points:
+        best = next(iter(points))
+    return best
+
+
+def board_to_events(board: Board) -> list[dict]:
+    """Board -> Odds API shaped event dicts, main lines only."""
+    per_event: dict[str, dict] = {}
+    for group in board.groups.values():
+        if group.key.market not in ("spreads", "totals", "h2h") or group.key.subject:
+            continue
+        ev = per_event.setdefault(group.event.event_id, {
+            "home_team": group.event.home_team, "away_team": group.event.away_team,
+            "commence_time": group.event.commence_time.isoformat().replace("+00:00", "Z"),
+            "_books": {},
+        })
+        for side, per_book in group.quotes.items():
+            for book, q in per_book.items():
+                slot = ev["_books"].setdefault(book, {"spreads": {}, "totals": {}})
+                if group.key.market == "spreads" and group.key.point is not None:
+                    slot["spreads"].setdefault(group.key.point, {})[side] = q.decimal
+                elif group.key.market == "totals" and group.key.point is not None:
+                    slot["totals"].setdefault(group.key.point, {})[side] = q.decimal
+
+    out = []
+    for ev in per_event.values():
+        bookmakers = []
+        for book, markets in ev.pop("_books").items():
+            entry = {"key": book, "markets": []}
+            spread_pt = _main_line(markets["spreads"])
+            if spread_pt is not None:
+                entry["markets"].append({"key": "spreads", "outcomes": [
+                    {"name": ev["home_team"], "point": float(spread_pt)},
+                    {"name": ev["away_team"], "point": -float(spread_pt)}]})
+            total_pt = _main_line(markets["totals"])
+            if total_pt is not None:
+                entry["markets"].append({"key": "totals", "outcomes": [
+                    {"name": "Over", "point": float(total_pt)},
+                    {"name": "Under", "point": float(total_pt)}]})
+            if entry["markets"]:
+                bookmakers.append(entry)
+        if bookmakers:
+            ev["bookmakers"] = bookmakers
+            out.append(ev)
+    return out
+
+
+def _free_events(sport_key: str) -> list[dict]:
+    """Odds-API-shaped events for one league, from whichever free path is ready.
+
+    PREFERRED: the market data store (edge/odds). It carries THREE books --
+    DraftKings, FanDuel and Fanatics (NFL id 11730, found by the Oddschecker
+    sweep) -- against the two this module could reach on its own, which is the
+    whole accuracy argument for dropping the paid feed: most of the gain from
+    averaging arrives by the third or fourth book, and two was below that.
+    It also costs no network call at all, because the agent already scraped it.
+
+    FALLBACK: scrape DraftKings and FanDuel inline, exactly as before. Kept so
+    this module still works on a machine with no collection scheduled -- a
+    missed scan degrades to the old two-book reading rather than to nothing.
+    """
+    try:
+        # scraped_client resolves store-then-snapshot, so this works on the
+        # desktop AND on Streamlit Cloud, which has neither a store nor the
+        # ability to scrape.
+        from edge.odds.cli import scraped_client
+
+        client = scraped_client(sport_key, "pickem")
+        events = client.get_featured_odds(sport_key, ["spreads", "totals"])
+        if events:
+            log.info("pickem_free: %d events from the odds store", len(events))
+            return events
+    except Exception as exc:
+        log.info("pickem_free: odds store unavailable (%s); scraping inline", exc)
+
+    cfg = ArbConfig()
+    board = Board()
+
+    fd = FanDuelScrape(state=cfg.state)
+    try:
+        league = fd.league_page(sport_key)
+        fd.ingest_event(board, league, sport_key, strict_match=False)
+    except Exception as exc:
+        log.warning("fanduel nfl: %s", exc)
+
+    # FanDuel above created the events; DraftKings must MATCH onto them rather
+    # than create its own, or every game ends up with one book and the
+    # consensus is a single reading dressed up as an average.
+    dk = DraftKingsLeague(state=cfg.state)
+    try:
+        dk.ingest(board, dk.fetch(sport_key), sport_key, strict_match=True)
+    except Exception as exc:
+        log.warning("draftkings nfl: %s", exc)
+
+    return board_to_events(board)
+
+
+def _within_window(kickoff: str | None, start: datetime, end: datetime) -> bool:
+    if not kickoff:
+        return False
+    try:
+        ts = datetime.fromisoformat(kickoff.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    return start <= ts <= end
+
+
+def filter_to_slate(games: list[LiveGame],
+                    window_start: datetime | None = None,
+                    window_end: datetime | None = None,
+                    days_ahead: float = 8.0,
+                    allow_duplicates: bool = False) -> list[LiveGame]:
+    """Trim a raw book board to ONE slate, and refuse an ambiguous one.
+
+    Split out of fetch_week_free so it can be tested without the network --
+    this is the guard that stops preseason lines being served as Week 1.
+    """
+    start = window_start or datetime.now(timezone.utc)
+    end = window_end or (start + timedelta(days=days_ahead))
+    kept = [g for g in games if _within_window(g.kickoff, start, end)]
+    dropped = len(games) - len(kept)
+    if dropped:
+        log.info("pickem_free: dropped %d event(s) outside %s..%s",
+                 dropped, start.date(), end.date())
+
+    seen: set[str] = set()
+    dupes: list[str] = []
+    for g in kept:
+        if g.home_abbr in seen:
+            dupes.append(g.home_abbr)
+        seen.add(g.home_abbr)
+    if dupes and not allow_duplicates:
+        raise ValueError(
+            f"pickem_free: {len(set(dupes))} home team(s) appear more than once "
+            f"in window {start.date()}..{end.date()}: {sorted(set(dupes))}. A "
+            "team plays once a week, so this means the window is catching two "
+            "slates and any consumer keying by home_abbr would silently use the "
+            "wrong game. Narrow the window, or pass allow_duplicates=True if you "
+            "genuinely want the raw board.")
+
+    kept.sort(key=lambda g: g.kickoff or "")
+    return kept
+
+
+def fetch_week_free(sport_key: str = SPORT_KEY, max_events: int = 0,
+                    days_ahead: float = 8.0,
+                    window_start: datetime | None = None,
+                    window_end: datetime | None = None,
+                    allow_duplicates: bool = False) -> list[LiveGame]:
+    """Free replacement for edge.pickem_live.fetch_week. Costs 0 credits.
+
+    WINDOW FILTER -- do not remove without reading this.
+    ---------------------------------------------------
+    The books' league endpoints return their ENTIRE visible board, not one
+    week. Measured 2026-08-24: 44 events spanning preseason (Aug 28) through
+    Christmas, with 12 home teams appearing 2-4 times.
+
+    Every caller keys these by home_abbr, so duplicates silently collapse to
+    whichever entry happens to land last -- and the survivor may be a
+    PRESEASON game. That produced fabricated maximum-confidence picks against
+    the real Week 1 slate: CLE +7.5 at a claimed +9.00 edge, NE +3.5 at
+    +5.00, both pure artifacts of a preseason line matched onto a Week 1
+    matchup. Five of six STRONG picks were garbage.
+
+    So: keep only kickoffs inside a window, and refuse to return a board with
+    duplicate home teams unless the caller explicitly opts in. A team plays
+    once a week; a repeat means the window is wrong.
+
+    PREFER `window_start` / `window_end` over `days_ahead`. The rolling default
+    answers "what is on in the next 8 days", which during preseason is the
+    PRESEASON slate, not the pick'em slate. Callers that know which games they
+    want -- and scripts/pickem_capture.py does, from
+    data/pickem_current_week.csv -- should pass the real kickoff range.
+    """
+    games = _parse_events(_free_events(sport_key))
+
+    games = filter_to_slate(games, window_start, window_end, days_ahead,
+                            allow_duplicates)
+    return games[:max_events] if max_events else games
+
+
+def compare(paid: list[LiveGame], free: list[LiveGame]) -> list[dict]:
+    """Line-by-line difference between the paid and free consensus, so the
+    trade can be judged on a real slate rather than argued about."""
+    by_key = {(g.home_abbr, g.away_abbr): g for g in free}
+    rows = []
+    for p in paid:
+        f = by_key.get((p.home_abbr, p.away_abbr))
+        if not f or p.live_line is None or f.live_line is None:
+            continue
+        rows.append({
+            "game": f"{p.away_abbr} @ {p.home_abbr}",
+            "paid_line": round(p.live_line, 2), "free_line": round(f.live_line, 2),
+            "line_diff": round(f.live_line - p.live_line, 2),
+            "paid_books": p.n_books, "free_books": f.n_books,
+            "paid_total": None if p.total is None else round(p.total, 2),
+            "free_total": None if f.total is None else round(f.total, 2),
+        })
+    return rows

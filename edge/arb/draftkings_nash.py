@@ -1,0 +1,386 @@
+"""DraftKings 'sportscontent' endpoint — per-event markets including props.
+
+    /sites/US-CT-SB/api/sportscontent/controldata/event/eventSubcategory/v1/markets
+      ?templateVars=<eventId>,<subCategoryId>
+      &marketsQuery=$filter=eventId eq '<eventId>' AND
+                    clientMetadata/subCategoryId eq '<subCategoryId>' AND ...
+      &entity=markets
+
+`US-CT-SB` is the Connecticut skin and `x-pe-loc: US-CT` matches it. No
+cookies. The host geo/bot-blocks datacenter IPs, so captures must come from a
+browser in-state.
+
+The ids appear TWICE — in `templateVars` and again inside the OData filter.
+Rewriting only one produces a request whose filter disagrees with its template
+vars, so retargeting must rewrite both together.
+"""
+from __future__ import annotations
+
+import logging
+import re
+from datetime import datetime, timezone
+from urllib.parse import parse_qsl, quote, urlencode, urlparse, urlunparse
+
+from .models import Board, GroupKey, Quote
+from .normalize import normalize_outcome, slug
+from .marketmap import canonical_market, is_full_game, split_player
+from .matching import match_event
+
+# Canonical keys whose subject is a person; a one-player market is legitimate
+# where a one-TEAM market is not.
+PLAYER_MARKETS = ("pitcher_", "batter_", "player_")
+
+log = logging.getLogger("arb.dk_nash")
+
+EVENT_ID_RE = re.compile(r"(eventId\s+eq\s+')([^']+)(')")
+SUBCAT_RE = re.compile(r"(subCategoryId\s+eq\s+')([^']+)(')")
+# the whole "AND clientMetadata/subCategoryId eq 'NNN'" clause, so it can be dropped
+SUBCAT_CLAUSE_RE = re.compile(
+    r"\s+AND\s+clientMetadata/subCategoryId\s+eq\s+'[^']*'", re.IGNORECASE)
+
+
+def retarget(url: str, event_id: str | int | None = None,
+             subcategory_id: str | int | None = None) -> str:
+    """Point a captured request at a different event/subcategory.
+
+    Rewrites `templateVars` and the OData `$filter` in step. Leaving them
+    inconsistent is the failure mode this exists to prevent.
+    """
+    u = urlparse(url)
+    pairs = parse_qsl(u.query, keep_blank_values=True)
+    out: list[tuple[str, str]] = []
+    for k, v in pairs:
+        if k == "templateVars":
+            parts = v.split(",")
+            if event_id is not None and parts:
+                parts[0] = str(event_id)
+            if subcategory_id is not None and len(parts) > 1:
+                parts[1] = str(subcategory_id)
+            v = ",".join(parts)
+        elif k == "marketsQuery":
+            if event_id is not None:
+                v = EVENT_ID_RE.sub(lambda m: f"{m.group(1)}{event_id}{m.group(3)}", v)
+            if subcategory_id is not None:
+                v = SUBCAT_RE.sub(lambda m: f"{m.group(1)}{subcategory_id}{m.group(3)}", v)
+        out.append((k, v))
+    # the browser sends %20, not '+'; match it for a picky endpoint
+    return urlunparse(u._replace(query=urlencode(out, quote_via=quote)))
+
+
+def all_markets_url(url: str, event_id: str | int) -> str:
+    """Build an every-market-on-the-event query by dropping the subcategory.
+
+    WARNING: this endpoint REJECTS it with {"errorStatus":{"code":"MRKTBFF-400"}}.
+    `eventSubcategory/v1/markets` requires the subCategoryId clause -- the name
+    is the clue. Kept because the query form is right for any sibling endpoint
+    that does accept a bare event filter; do not point it at this one.
+
+    Use harvest_template_vars() + retarget() instead: subCategoryId values are
+    per-event (17320 returns props on one game and an empty array on another),
+    so they must be discovered rather than assumed.
+    """
+    out = retarget(url, event_id=event_id)
+    u = urlparse(out)
+    pairs = []
+    for k, v in parse_qsl(u.query, keep_blank_values=True):
+        if k == "marketsQuery":
+            v = SUBCAT_CLAUSE_RE.sub("", v)
+        elif k == "templateVars":
+            v = str(event_id)
+        pairs.append((k, v))
+    return urlunparse(u._replace(query=urlencode(pairs, quote_via=quote)))
+
+
+def harvest_template_vars(urls) -> list[tuple[str, str]]:
+    """Pull every (eventId, subCategoryId) pair out of URLs the page already used.
+
+    The browser has, by loading the event page and its prop tabs, already made
+    a request per subcategory. Reading the ids back off those URLs discovers
+    them exactly, instead of guessing ids that differ per event.
+    """
+    seen: list[tuple[str, str]] = []
+    for u in urls:
+        if "eventSubcategory" not in u:
+            continue
+        ev, sub = ids_in(u)
+        if ev and sub and (ev, sub) not in seen:
+            seen.append((ev, sub))
+    return seen
+
+
+def ids_in(url: str) -> tuple[str | None, str | None]:
+    """The (eventId, subCategoryId) a URL currently targets, or None."""
+    q = dict(parse_qsl(urlparse(url).query, keep_blank_values=True))
+    tv = (q.get("templateVars") or "").split(",")
+    return (tv[0] or None) if tv else None, (tv[1] or None) if len(tv) > 1 else None
+
+
+def is_consistent(url: str) -> bool:
+    """True when templateVars and the OData filter name the same ids."""
+    q = dict(parse_qsl(urlparse(url).query, keep_blank_values=True))
+    ev, sub = ids_in(url)
+    query = q.get("marketsQuery") or ""
+    m_ev, m_sub = EVENT_ID_RE.search(query), SUBCAT_RE.search(query)
+    if m_ev and ev and m_ev.group(2) != ev:
+        return False
+    if m_sub and sub and m_sub.group(2) != sub:
+        return False
+    return True
+
+
+# --------------------------------------------------------------------------
+# parsing
+# --------------------------------------------------------------------------
+def looks_like_sportscontent(payload) -> bool:
+    return (isinstance(payload, dict)
+            and isinstance(payload.get("markets"), list)
+            and isinstance(payload.get("selections"), list))
+
+
+def echoed_query(payload: dict) -> str | None:
+    """The filter the server actually ran, from `subscriptionPartials`.
+
+    An empty `markets` array with a populated echo means the filter was valid
+    but matched nothing -- usually a subCategoryId that does not exist on this
+    event, rather than a malformed request.
+    """
+    for part in (payload.get("subscriptionPartials") or {}).values():
+        if isinstance(part, dict) and part.get("query"):
+            return part["query"]
+    return None
+
+
+# DraftKings renders negative American odds with a UNICODE MINUS (U+2212),
+# not an ASCII hyphen: "\u2212215". float() raises on it, so any american-odds
+# fallback silently dies unless it is normalised first.
+UNICODE_MINUSES = {"\u2212": "-", "\u2013": "-", "\u2014": "-", "\u2796": "-"}
+
+
+def parse_american(text) -> float | None:
+    s = str(text).strip()
+    for bad, good in UNICODE_MINUSES.items():
+        s = s.replace(bad, good)
+    s = s.replace("+", "")
+    try:
+        return float(s)
+    except (TypeError, ValueError):
+        return None
+
+
+def _decimal(sel: dict) -> float | None:
+    # trueOdds is already a float; the decimal string is a formatted duplicate
+    true = sel.get("trueOdds")
+    if isinstance(true, (int, float)) and true > 1.0:
+        return float(true)
+    odds = sel.get("displayOdds") or {}
+    for key in ("decimal", "Decimal"):
+        if odds.get(key):
+            try:
+                return float(odds[key])
+            except (TypeError, ValueError):
+                pass
+    american = parse_american(odds.get("american") or odds.get("American") or "")
+    if american:
+        from . import oddsmath as om
+        try:
+            return om.american_to_decimal(american)
+        except ValueError:
+            return None
+    return None
+
+
+def milestone_point(sel: dict) -> float | None:
+    """A milestone selection labelled "2+" is Over 1.5.
+
+    DraftKings prices these props as thresholds, not two-sided lines: labels
+    read 1+/2+/3+ with a `milestoneValue`. Left alone they never meet a book's
+    Over/Under, so N is converted to Over (N - 0.5) -- which is the same bet
+    and pairs directly against the aggregator feed and Fanatics Markets.
+    """
+    n = sel.get("milestoneValue")
+    if isinstance(n, (int, float)) and n >= 1:
+        return float(n) - 0.5
+    m = re.match(r"^\s*(\d+(?:\.\d+)?)\s*\+\s*$", str(sel.get("label") or ""))
+    return float(m.group(1)) - 0.5 if m else None
+
+
+def market_players(sels: list[dict]) -> set[str]:
+    """The players a market is about, read off the selections themselves.
+
+    `participants` is typed: a game line carries Team entries (or none at all),
+    a prop carries exactly one Player. Type is what separates them -- the name
+    alone cannot, and the market label often cannot either.
+    """
+    return {p.get("name") for s in sels for p in (s.get("participants") or [])
+            if p.get("type") == "Player" and p.get("name")}
+
+
+def ingest_sportscontent(board: Board, payload: dict, book: str = "draftkings",
+                         sport_key: str | None = None, strict_match: bool = True,
+                         event: object | None = None,
+                         is_main_line: bool = False) -> dict:
+    """Join `selections` to `markets` on marketId and fold onto the board.
+
+    Shape is inferred from DraftKings' newer sportscontent API: two parallel
+    top-level arrays rather than nested offers. `arb scrape inspect` reports
+    what actually parsed, so a mismatch surfaces immediately.
+
+    `is_main_line` marks this call as the book's own full-game Spread/Total
+    fetch, as opposed to an alternate-line pull -- the caller knows which one
+    it asked for, and that is the only place the distinction still exists,
+    since a totals/spreads GroupKey looks identical either way once it is on
+    the board. Recorded on the board so a later alternate-ladder rung can be
+    checked against the number DraftKings itself currently posts as the line.
+    """
+    stats = {"markets": 0, "selections": 0, "quotes": 0,
+             "markets_unmapped": set(), "unmatched": 0}
+    markets = {str(m.get("id")): m for m in payload.get("markets") or []}
+    stats["markets"] = len(markets)
+    now = datetime.now(timezone.utc)
+
+    target = event
+    if target is None:
+        if strict_match:
+            stats["unmatched"] = 1
+            return stats
+        return stats
+
+    by_market: dict[str, list[dict]] = {}
+    for sel in payload.get("selections") or []:
+        by_market.setdefault(str(sel.get("marketId")), []).append(sel)
+    stats["selections"] = sum(len(v) for v in by_market.values())
+
+    for mid, sels in by_market.items():
+        market = markets.get(mid)
+        if not market:
+            continue
+        # Prefer the structured fields over parsing the display name.
+        # "Yordan Alvarez Home Runs" has no separator for split_player to find,
+        # and "Luis Garcia (NYY) Hits" would lose the team suffix. marketType
+        # and participants carry both cleanly.
+        label = (market.get("marketType") or {}).get("name") or market.get("name") or ""
+        _, label_player = split_player(market.get("name") or "")
+
+        # The player has to be known BEFORE the market key, because it is what
+        # decides which rule set wins: "Total Bases" is a game total with no
+        # player and a prop with one. The league feed names markets
+        # "<Player> <Stat> O/U" with no separator, so split_player returned
+        # None and every prop fell through to the game rules -- a starter's
+        # "Outs O/U" was read as a game total, as were Total Bases and every
+        # other O/U prop tab.
+        players = market_players(sels)
+        if len(players) > 1:
+            # "Combined Strikeouts", "Either Pitcher to record a win": no single
+            # subject to key it by, and pairing it against a one-player line
+            # would invent an arb. Dropped rather than guessed at.
+            stats["markets_unmapped"].add(f"{label} (multi-player)")
+            continue
+        player = (players.pop() if players else None) or label_player
+
+        # A REFUSAL MUST STICK. `is_full_game` says "this is not the whole
+        # game, never map it"; canonical_market returning None says only "no
+        # rule matched". Collapsing the two let the display-name fallback below
+        # resurrect a market the guard had already thrown out:
+        #
+        #   marketType.name "Alternate Team Total Runs"  -> refused, correctly
+        #   market.name     "Alternate CIN Reds Total Runs" -> `totals`
+        #
+        # so one team's run total was filed as the GAME total. On SD Padres @
+        # CIN Reds the Reds' team Over 6.5 (+330) sat in the same group as the
+        # game Over 6.5 (-310), best() took the +330, and the result was
+        # reported as a free middle and a straight arbitrage. The book's own
+        # app showed -310 the whole time.
+        if (not is_full_game(label, sport_key)
+                or not is_full_game(market.get("name") or "", sport_key)):
+            stats["markets_unmapped"].add(f"{label} (not the full game)")
+            continue
+
+        mkey = canonical_market(label, player=player, sport_key=sport_key)
+        if mkey is None and market.get("name"):
+            # A marketType can be uninformative where the display name is not:
+            # "Win Probability" against "Will Shane McClanahan Record a Win?".
+            mkey = canonical_market(market["name"], player=player, sport_key=sport_key)
+        if mkey is None:
+            stats["markets_unmapped"].add(label)
+            continue
+
+        # Independent of any name: a market every selection of which points at
+        # ONE team is that team's market, not the game's. A game total carries
+        # no participants at all; a moneyline or spread carries both teams. So
+        # a single distinct team across two or more selections is the shape of
+        # a team total, whatever the market happens to be called -- which is
+        # the backstop for the next label nobody anticipated.
+        teams = {p.get("name") for sel in sels for p in (sel.get("participants") or [])
+                 if p.get("type") == "Team" and p.get("name")}
+        if len(teams) == 1 and len(sels) > 1 and not mkey.startswith(PLAYER_MARKETS):
+            stats["markets_unmapped"].add(f"{label} (one team: {teams.pop()})")
+            continue
+
+        # Golf head-to-heads: two golfers, no over/under, and the whole field
+        # shares one market key on one event -- so each pairing needs its own
+        # subject or all fourteen collapse into one group. Built from the two
+        # runner labels sorted, the same key FanDuel's side derives, so the two
+        # books land on the same group.
+        #
+        # DraftKings also offers a "(3 Way)" variant of every one of these,
+        # carrying an explicit Tie selection. That is a DIFFERENT market -- the
+        # two-way version pushes on a tie, the three-way pays a third outcome --
+        # and pairing them would be pricing two different bets against each
+        # other. Decided here on the runner count rather than by pattern:
+        # participants are typed "Team" for golfers, and the Tie runner has
+        # none at all.
+        if mkey.startswith("golf_"):
+            labels = [x.get("label") for x in sels if (x.get("participants") or [])]
+            names = sorted({slug(l) for l in labels if l})
+            if len(names) != 2 or len(sels) != 2:
+                stats["markets_unmapped"].add(
+                    f"{label} ({len(sels)} runners — three-way or not a pairing)")
+                continue
+            for sel in sels:
+                price = _decimal(sel)
+                if price is None or price <= 1.0:
+                    continue
+                board.group(GroupKey(target.event_id, mkey, "|".join(names), None),
+                            target).add(Quote(book=book, side=slug(sel.get("label") or ""),
+                                              decimal=price, point=None, last_update=now))
+                stats["quotes"] += 1
+            continue
+
+        for sel in sels:
+            price = _decimal(sel)
+            if price is None or price <= 1.0:
+                continue
+            point = sel.get("points")
+            if point is not None:
+                try:
+                    point = float(point)
+                except (TypeError, ValueError):
+                    point = None
+
+            label_text = sel.get("label") or ""
+            ms = milestone_point(sel)
+            if ms is not None:
+                side, subject, gpoint = "over", player, ms
+            else:
+                norm = normalize_outcome(mkey, label_text, point, player,
+                                         target.home_team, target.away_team)
+                if norm is None:
+                    continue
+                side, subject, gpoint = norm
+                point = point if point is not None else gpoint
+            board.group(GroupKey(target.event_id, mkey, subject, gpoint), target).add(
+                Quote(book=book, side=side, decimal=price, point=gpoint, last_update=now))
+            stats["quotes"] += 1
+            if mkey in ("totals", "spreads"):
+                if is_main_line:
+                    board.record_main_point(target.event_id, mkey, book, gpoint)
+                # DraftKings tags exactly one selection per alternate ladder
+                # "main": true -- the rung its own app currently treats as
+                # equal to the main line. True regardless of which call this
+                # is: the base Game market's own selections are trivially all
+                # "main" (a single-line market), which is a no-op restating
+                # main_points, but reading it on an ALTERNATE-line call is
+                # what catches DraftKings' own data disagreeing with itself.
+                if sel.get("main") is True:
+                    board.record_ladder_main_point(target.event_id, mkey, book, gpoint)
+    return stats

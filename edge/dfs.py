@@ -1,0 +1,1161 @@
+"""DFS (DraftKings MLB Classic) core: salary fetch + Vegas-implied projections.
+
+The projection edge: DFS salaries are FROZEN for the slate (no sharp correction),
+while sportsbook props are the sharpest live player projection available. Convert
+props -> projected DK fantasy points, divide by salary -> value. We're competing
+with other DFS players + a stale salary, not the book.
+
+DK MLB Classic: roster 2 P / C / 1B / 2B / 3B / SS / 3 OF, $50,000 cap.
+"""
+from __future__ import annotations
+
+import json
+import sys
+import urllib.parse
+import urllib.request
+from statistics import NormalDist
+
+from .arb import http as _http
+from .oddsmath import devig
+
+_N = NormalDist()
+# A REAL browser User-Agent, not "Mozilla/5.0". api.draftkings.com rejects the
+# short form with the same Akamai 403 it gives a datacenter IP -- isolated
+# 2026-09-19: full UA over HTTP/2 -> 200, short UA over HTTP/2 -> 403. Two
+# independent gates, and this is the one that is pure string matching.
+_UA = {"User-Agent": _http.DEFAULT_UA, "Accept": "application/json"}
+
+# DK MLB pitcher scoring (per-out = 2.25/inning ÷ 3). CG/NH ignored (~0 prob).
+P_SCORE = {"out": 0.75, "K": 2.0, "win": 4.0, "ER": -2.0, "hit": -0.6, "bb": -0.6}
+# typical std devs for turning a single over/under line into an implied mean
+P_SIGMA = {"pitcher_outs": 4.0, "pitcher_strikeouts": 2.0, "pitcher_earned_runs": 2.0,
+           "pitcher_hits_allowed": 2.5, "pitcher_walks": 1.2}
+P_MARKETS = list(P_SIGMA) + ["pitcher_record_a_win"]
+
+
+def norm(name: str) -> str:
+    import unicodedata
+    s = unicodedata.normalize("NFKD", name or "").encode("ascii", "ignore").decode()
+    return "".join(c for c in s.lower() if c.isalnum())
+
+
+def _get(url):
+    """One JSON GET for every upstream this module reads.
+
+    DRAFTKINGS TAKES THE curl/HTTP-2 PATH, EVERYTHING ELSE TAKES urllib.
+    2026-09-19: api.draftkings.com enforces two independent gates, and a
+    request has to clear BOTH or it gets an indistinguishable Akamai 403:
+
+      1. HTTP/2. Forced HTTP/1.1 with otherwise-perfect headers -> 403, and
+         urllib can only ever speak HTTP/1.1.
+      2. A full browser User-Agent. "Mozilla/5.0" -> 403 even over HTTP/2.
+
+    This module had its own private urllib `_get` and so failed both, which is
+    why the 2026-09-19 fix to edge/arb/http.py rescued arbitrage and pick'em
+    but left DFS broken for a further day -- the salaries silently came from
+    the previous day's snapshot instead (see _draftables_raw). The transport
+    rule now lives in exactly one place. See DRAFTKINGS_ACCESS.md.
+
+    statsapi.mlb.com and the rest keep the plain urllib path: nothing gates
+    them, and routing them through a subprocess would be strictly worse.
+    """
+    host = urllib.parse.urlparse(url).hostname or ""
+    if not _http.is_draftkings(host):
+        return json.load(urllib.request.urlopen(
+            urllib.request.Request(url, headers=_UA), timeout=30))
+    r = _http.Session().get(url, headers=_UA, timeout=30)
+    if r.status_code >= 400:
+        raise _http.HTTPError(f"HTTP Error {r.status_code}: DraftKings {url}", r)
+    return r.json()
+
+
+# --- salaries (public draftables API; no auth) -------------------------------
+
+def draft_groups(sport: str) -> list[dict]:
+    """DraftKings draft groups for any sport code (MLB, NFL, NBA, ...).
+
+    The lobby endpoint is the same for every sport and takes the code as a
+    query parameter, so this needed generalising rather than duplicating --
+    see edge/dfs_sport.py for why the sport-specific parts are a table now.
+    """
+    return _get(f"https://www.draftkings.com/lobby/getcontests?sport={sport}").get("DraftGroups", [])
+
+
+def mlb_draft_groups() -> list[dict]:
+    """Back-compat alias. Every existing MLB call site uses this name."""
+    return draft_groups("MLB")
+
+
+def fetch_draftables(draft_group_id: int) -> dict[str, dict]:
+    """{normalized name: {name, salary, position, team, dk_fppg}} for a draft group.
+    dk_fppg = DK's own "Fantasy Points Per Game" (draftStatAttributes id 408) --
+    a free, always-available baseline: the validation methodology should always
+    check incremental value over this (and over salary) before trusting a corr
+    number in isolation. Not backfillable for past slates (DK only serves
+    current/upcoming draftables), so this only accumulates going forward.
+
+    Skips any entry with no `matchup` (competition.name) at all. Confirmed
+    live 2026-07-18: a real "Main" draft group correctly declared 7 games/14
+    teams but its own draftables response also included the FULL active
+    rosters of two entirely unrelated teams (NYM, PHI -- whose only game that
+    day was a totally different time window, not one of this slate's 7 real
+    matchups) -- a DK-side data bleed, not a resolution bug on this end
+    (confirmed: the group's declared GameCount and its real 7 matchups were
+    internally consistent; only the extra two teams' entries were wrong).
+    Checked cleanly on that real data: every legitimate player had a matchup
+    populated, every erroneous cross-contaminated one had none -- a safe,
+    exact discriminator, not a heuristic."""
+    out = {}
+    for p in _draftables_raw(draft_group_id):
+        k = norm(p["displayName"])
+        if k not in out:  # dedupe multi-slot rows
+            comp = p.get("competition") or {}
+            if not comp.get("name"):
+                continue
+            stats = {a.get("id"): a.get("value")
+                     for a in (p.get("draftStatAttributes") or [])}
+            # DK's "Fantasy Points Per Game" lives under a DIFFERENT stat id
+            # per sport, and asking for the wrong one returns None rather than
+            # an error -- which reads as "this player has no history" for every
+            # player on the board. Verified live 2026-09-24: 408 for MLB and
+            # NFL, 174 for CFB, 653 for NASCAR. A payload carries exactly one
+            # of them, so a priority list is safe rather than ambiguous.
+            fppg = next((stats[i] for i in (408, 174, 653) if i in stats), None)
+            try:
+                dk_fppg = float(fppg)
+            except (TypeError, ValueError):
+                dk_fppg = None  # "-" for players with no game history yet (rookies/callups)
+            out[k] = {"name": p["displayName"], "salary": p.get("salary"),
+                      "position": p.get("position"), "team": p.get("teamAbbreviation"),
+                      "game": comp.get("competitionId"), "matchup": comp.get("name"),
+                      "start": comp.get("startTime"), "dk_fppg": dk_fppg,
+                      # DK's own player id. For NASCAR this IS NASCAR's
+                      # driver_id (Larson 4030 in both), which is the exact
+                      # join edge/dfs_run_nascar.py relies on.
+                      "player_id": p.get("playerId")}
+    return out
+
+
+_SNAP_DIR = __import__("pathlib").Path(__file__).resolve().parents[1] / "data" / "draftables_snapshot"
+_dt_mod = __import__("datetime")
+
+# "live" | "snapshot <when>" | "failed" -- set by _draftables_raw so a caller
+# (the Streamlit pages, scripts/draftables_publish.py) can tell the user which
+# one they are looking at instead of guessing from the numbers.
+LAST_DRAFTABLES_SOURCE = "live"
+
+
+def _draftables_raw(draft_group_id: int) -> list[dict]:
+    """Raw draftables list, falling back to data/draftables_snapshot/<gid>.json.
+
+    DK started returning 403 to Streamlit Cloud's IPs for this endpoint on
+    2026-09-16 (same request works fine from a home IP; the www lobby call
+    still worked from Cloud). Salaries are frozen per draft group, so a
+    snapshot saved locally via save_draftables_snapshot() and pushed is exact,
+    and keying by gid means it can never serve the wrong slate. This is the
+    datacenter-IP block, not the volume-based one arbitrage hit 2026-09-18 --
+    see DRAFTKINGS_ACCESS.md for the difference before changing this poll's
+    frequency or scope."""
+    url = f"https://api.draftkings.com/draftgroups/v1/draftgroups/{draft_group_id}/draftables"
+    global LAST_DRAFTABLES_SOURCE
+    try:
+        rows = _get(url).get("draftables", [])
+        LAST_DRAFTABLES_SOURCE = "live"
+        return rows
+    except Exception as exc:
+        snap = _SNAP_DIR / f"{draft_group_id}.json"
+        if snap.exists():
+            # Say so. This fallback silently served 2026-09-18 salaries for a
+            # whole day on 09-19 because it looked identical to success from
+            # every caller -- the transport was broken, not the IP, and
+            # nothing surfaced it. A stale snapshot is still the right answer
+            # for Streamlit Cloud (datacenter-blocked by design); it is a
+            # BUG SIGNAL on the desktop, where the live call should work.
+            age = _dt_mod.datetime.fromtimestamp(snap.stat().st_mtime)
+            LAST_DRAFTABLES_SOURCE = f"snapshot {age:%Y-%m-%d %H:%M}"
+            print(f"edge.dfs: DK draftables {draft_group_id} live fetch failed "
+                  f"({type(exc).__name__}: {exc}) -- falling back to snapshot "
+                  f"saved {age:%Y-%m-%d %H:%M}", file=sys.stderr)
+            return json.loads(snap.read_text())
+        LAST_DRAFTABLES_SOURCE = "failed"
+        raise
+
+
+def save_draftables_snapshot(draft_group_id: int) -> int:
+    """Fetch live and write the trimmed snapshot the Cloud fallback reads.
+
+    Returns rows written; 0 (and no file) for a group DK hasn't priced yet, so
+    the fallback never pins a slate to a pre-salary copy. Rewrites only on
+    change so scripts/draftables_publish.py doesn't commit a no-op."""
+    url = f"https://api.draftkings.com/draftgroups/v1/draftgroups/{draft_group_id}/draftables"
+    keep = ("displayName", "salary", "position", "teamAbbreviation", "competition", "draftStatAttributes")
+    rows, seen = [], set()
+    for p in _get(url).get("draftables", []):
+        r = {k: p.get(k) for k in keep}
+        r["draftStatAttributes"] = [a for a in (r["draftStatAttributes"] or []) if a.get("id") == 408]
+        key = json.dumps(r, sort_keys=True)
+        if key not in seen:  # exact dupes only -- fetch_draftables' first-row-wins stays identical
+            seen.add(key)
+            rows.append(r)
+    if not any(r.get("salary") for r in rows):
+        return 0
+    _SNAP_DIR.mkdir(parents=True, exist_ok=True)
+    path = _SNAP_DIR / f"{draft_group_id}.json"
+    text = json.dumps(rows)
+    if not path.exists() or path.read_text() != text:
+        path.write_text(text)
+    return len(rows)
+
+
+def parse_pos(s: str) -> set:
+    """DraftKings eligible slots from a 'C/1B' style string. SP/RP -> P."""
+    out = set()
+    for tok in (s or "").split("/"):
+        t = tok.strip().upper()
+        if t in ("SP", "RP"):
+            out.add("P")
+        elif t in ("C", "1B", "2B", "3B", "SS", "OF"):
+            out.add(t)
+    return out
+
+
+def player_markets(dk_bookmaker: dict, player_name: str) -> dict:
+    """{market_key: {side: price, 'point': x}} for one player from a DK payload."""
+    out = {}
+    for m in dk_bookmaker.get("markets", []):
+        d = {}
+        for o in m.get("outcomes", []):
+            if o.get("description") == player_name:
+                d[o["name"]] = o["price"]; d["point"] = o.get("point")
+        if d:
+            out[m["key"]] = d
+    return out
+
+
+def pick_priced_group(sport: str, groups: list[dict] | None = None,
+                      max_probe: int = 8) -> tuple[int | None, dict]:
+    """The biggest slate that DraftKings has actually PRICED, for any sport.
+
+    `main_slate_group` picks the group with no ContestStartTimeSuffix, which is
+    right for MLB and wrong for NFL: NFL's real main slates are suffixed
+    " (Wed-Mon)" / " (Sun-Mon)", and the unsuffixed group is next week's, listed
+    with every player but priced at salary=None. Verified live 2026-09-06 --
+    the unsuffixed NFL group had 580 players and 0 salaries while the
+    "(Wed-Mon)" group beside it had 813 priced.
+
+    So the rule here is a PROPERTY rather than a name: a group whose players
+    carry no salary is not a slate anything can be built from, whatever it is
+    called. Candidates are tried biggest-and-soonest first and the first priced
+    one wins, so the usual case costs a single extra request.
+
+    Returns (draft_group_id, salaries) so the caller does not fetch twice.
+    """
+    groups = groups if groups is not None else draft_groups(sport)
+    # Most games first (a main slate is the big one), then soonest.
+    ranked = sorted(groups, key=lambda g: (-(g.get("GameCount") or 0),
+                                           (g.get("StartDate") or "9999")))
+    for g in ranked[:max_probe]:
+        gid = g.get("DraftGroupId")
+        if gid is None:
+            continue
+        try:
+            salaries = fetch_draftables(gid)
+        except Exception:
+            continue
+        if any(v.get("salary") for v in salaries.values()):
+            return int(gid), salaries
+    return None, {}
+
+
+def main_slate_group(groups: list[dict]) -> int | None:
+    """Pick the standard full-slate Classic: no special suffix (Showdown/Tiers/
+    Snake/season-long all carry a suffix and many are unpriced), soonest start,
+    most games."""
+    cands = [g for g in groups if not (g.get("ContestStartTimeSuffix") or "").strip()] or groups
+    cands.sort(key=lambda g: ((g.get("StartDate") or "9999")[:10], -(g.get("GameCount") or 0)))
+    return cands[0].get("DraftGroupId") if cands else None
+
+
+# --- pitcher projection from props -------------------------------------------
+
+def _mean(over_dec, under_dec, line, sigma):
+    p = devig([over_dec, under_dec])[0]
+    p = min(max(p, 1e-3), 1 - 1e-3)
+    return line + sigma * _N.inv_cdf(p)
+
+
+# league per-IP rates, to impute components DK didn't post (keeps pitchers comparable)
+LEAGUE_PER_IP = {"ER": 4.10 / 9, "hit": 8.4 / 9, "bb": 3.2 / 9}
+WIN_DEFAULT = 0.43
+
+
+def project_pitcher(pmkts: dict) -> dict:
+    """Requires the core markets (outs + strikeouts); imputes any missing
+    ER/hits/walks/win from projected innings so every pitcher is scored on the
+    same components. Returns proj pts, breakdown, and which fields were imputed."""
+    o, k = pmkts.get("pitcher_outs"), pmkts.get("pitcher_strikeouts")
+    if not (o and "Over" in o and k and "Over" in k):
+        return {"proj": None, "components": {}, "have": [], "imputed": []}
+    outs = _mean(o["Over"], o["Under"], o["point"], P_SIGMA["pitcher_outs"])
+    Km = _mean(k["Over"], k["Under"], k["point"], P_SIGMA["pitcher_strikeouts"])
+    ip = outs / 3.0
+    comp = {"out": round(P_SCORE["out"] * outs, 1), "K": round(P_SCORE["K"] * Km, 1)}
+    imputed = []
+    # skill factor from strikeout-implied K/9: aces suppress ER/hits below league
+    # average, so scale IMPUTED negatives down for them (backtest fix: removed the
+    # systematic under-projection of high-end arms).
+    k9 = 27 * Km / outs if outs else 8.5
+    sf = min(1.35, max(0.55, 1 - 0.5 * (k9 - 8.5) / 8.5))
+
+    for mk, key in (("pitcher_earned_runs", "ER"), ("pitcher_hits_allowed", "hit"),
+                    ("pitcher_walks", "bb")):
+        d = pmkts.get(mk)
+        if d and "Over" in d and "Under" in d:
+            m = _mean(d["Over"], d["Under"], d["point"], P_SIGMA[mk])
+        else:
+            m = ip * LEAGUE_PER_IP[key] * (sf if key in ("ER", "hit") else 1.0)
+            imputed.append(key)
+        comp[key] = round(P_SCORE[key] * m, 1)
+
+    w = pmkts.get("pitcher_record_a_win")
+    if w and "Yes" in w and "No" in w:
+        pw = devig([w["Yes"], w["No"]])[0]
+    else:
+        pw = WIN_DEFAULT; imputed.append("win")
+    comp["win"] = round(P_SCORE["win"] * pw, 1)
+
+    return {"proj": round(sum(comp.values()), 1), "components": comp,
+            "have": [x for x in comp if x not in imputed], "imputed": imputed,
+            # prop-implied distribution anchors for the field simulator
+            # (edge/dfs_sim.py): the sim draws outings around these means
+            "outs_mean": round(outs, 1), "k_mean": round(Km, 1)}
+
+
+# === HITTERS ================================================================
+import os as _os
+import time as _time
+
+H_SIGMA = {"batter_hits": 0.9, "batter_total_bases": 1.3, "batter_rbis": 0.9,
+           "batter_runs_scored": 0.85, "batter_walks": 0.7, "batter_stolen_bases": 0.6}
+B_MARKETS = list(H_SIGMA)
+TEAM_TOTAL_AVG = 4.3
+# league per-PA fallbacks when a hitter has no season data
+_LG = {"hits": 0.24, "totalBases": 0.40, "rbi": 0.115, "runs": 0.125,
+       "baseOnBalls": 0.085, "stolenBases": 0.018, "homeRuns": 0.032}
+
+
+def season_hitting(season: int = 2026, cache_path: str | None = None, max_age=86400) -> dict:
+    """{(team_id, norm_name): season hitting totals} from MLB statsapi (free).
+    Cached to disk. Keyed by (team_id, name), not name alone -- same
+    real-collision reason as lineups_for_date (two different active players
+    can share a name; confirmed live 2026-07-12, two "Max Muncy"s). JSON has
+    no tuple keys, so the on-disk form packs the pair as "team_id|name"
+    (norm() names are alnum-only, so "|" can never collide with real name
+    content) and unpacks it back to a tuple on read."""
+    if cache_path and _os.path.exists(cache_path) and _time.time() - _os.path.getmtime(cache_path) < max_age:
+        raw = json.load(open(cache_path))
+        out = {}
+        for k, v in raw.items():
+            tid, name = k.split("|", 1)
+            out[(int(tid), name)] = v
+        return out
+    out = {}
+    for team_id in team_id_to_abbr():
+        try:
+            r = _get(f"https://statsapi.mlb.com/api/v1/teams/{team_id}/roster?rosterType=active"
+                     f"&hydrate=person(stats(group=[hitting],type=[season],season={season}))")
+        except Exception:
+            continue
+        for p in r.get("roster", []):
+            per = p["person"]
+            for s in per.get("stats", []):
+                sp = s.get("splits", [])
+                if sp and "plateAppearances" in sp[0]["stat"]:
+                    x = sp[0]["stat"]
+                    out[(int(team_id), norm(per["fullName"]))] = {k: x.get(k, 0) for k in
+                        ("plateAppearances", "homeRuns", "totalBases", "hits", "rbi", "runs", "baseOnBalls", "stolenBases")}
+                    break
+    if cache_path:
+        json.dump({f"{tid}|{name}": v for (tid, name), v in out.items()}, open(cache_path, "w"))
+    return out
+
+
+def _rate(sr, key, pa):
+    if sr and sr.get("plateAppearances"):
+        return sr.get(key, 0) / sr["plateAppearances"] * pa
+    return _LG[key] * pa
+
+
+def _hmean(d, sigma, default):
+    if d and "Over" in d and "Under" in d:
+        return _mean(d["Over"], d["Under"], d["point"], sigma)
+    return default
+
+
+def _hitter_points(hits, tb, hr, rbi, runs, bb, sb):
+    hits = max(hits, hr); tb = max(tb, hits)          # keep hits>=hr, tb>=hits
+    D = max(0.0, tb - hits - 3 * hr)                  # doubles (triples folded in)
+    S = max(0.0, hits - D - hr)                       # singles
+    return 3 * S + 5 * D + 10 * hr + 2 * rbi + 2 * runs + 2 * bb + 5 * sb
+
+
+def project_hitter(hmkts: dict, sr: dict, pa: float = 4.3) -> dict:
+    """Prop where DK posts it (sharp), season-rate where not (HR is always
+    season — DK posts no HR prop)."""
+    hits = _hmean(hmkts.get("batter_hits"), H_SIGMA["batter_hits"], _rate(sr, "hits", pa))
+    tb = _hmean(hmkts.get("batter_total_bases"), H_SIGMA["batter_total_bases"], _rate(sr, "totalBases", pa))
+    rbi = _hmean(hmkts.get("batter_rbis"), H_SIGMA["batter_rbis"], _rate(sr, "rbi", pa))
+    runs = _hmean(hmkts.get("batter_runs_scored"), H_SIGMA["batter_runs_scored"], _rate(sr, "runs", pa))
+    bb = _hmean(hmkts.get("batter_walks"), H_SIGMA["batter_walks"], _rate(sr, "baseOnBalls", pa))
+    sb = _hmean(hmkts.get("batter_stolen_bases"), H_SIGMA["batter_stolen_bases"], _rate(sr, "stolenBases", pa))
+    hr = _rate(sr, "homeRuns", pa)
+    backed = sum(1 for m in ("batter_hits", "batter_rbis", "batter_runs_scored", "batter_walks") if hmkts.get(m))
+    return {"proj": round(_hitter_points(hits, tb, hr, rbi, runs, bb, sb), 1),
+            "prop_backed": backed, "hr_pts": round(10 * hr, 1)}
+
+
+def allocate_hitter(sr: dict, team_total: float | None, pa: float = 4.3) -> dict | None:
+    """No props at all: project from season rate, scaling run/RBI by team context."""
+    if not sr or not sr.get("plateAppearances"):
+        return None
+    tf = (team_total or TEAM_TOTAL_AVG) / TEAM_TOTAL_AVG
+    hits, tb, hr = _rate(sr, "hits", pa), _rate(sr, "totalBases", pa), _rate(sr, "homeRuns", pa)
+    rbi, runs = _rate(sr, "rbi", pa) * tf, _rate(sr, "runs", pa) * tf
+    bb, sb = _rate(sr, "baseOnBalls", pa), _rate(sr, "stolenBases", pa)
+    return {"proj": round(_hitter_points(hits, tb, hr, rbi, runs, bb, sb), 1), "prop_backed": 0}
+
+
+# === OWNERSHIP (modeled; real projected ownership needs a paid feed) =========
+# Industry drivers: value (dominant) > salary tier > offense environment > order
+# > recency/news. Expressed as % of lineups rostering the player, so each
+# position normalizes to (roster slots x 100%). We power-softmax appeal within
+# position -- the no-training-data stand-in for a field-construction simulation.
+_OWN_SLOTS = {"P": 2, "C": 1, "1B": 1, "2B": 1, "3B": 1, "SS": 1, "OF": 3}
+
+
+def project_ownership(pool: list[dict], team_proj: dict | None = None, gamma: float = 1.5,
+                      pitcher_gamma: float = 7.0, bo_exp: float = 3.0) -> list[dict]:
+    # pitcher_gamma > gamma: on a full slate the field jams the top 1-2 arms far
+    # harder than it clusters hitters. Calibrated to real 6/30 ownership (elite SP
+    # hit ~36-48%, which a hitter-level gamma badly under-predicted).
+    #
+    # CORRECTED 2026-07-09 after an external review found the hitter softmax was
+    # "too hot" (every one of the top-8 predicted-ownership hitters was over-
+    # predicted, e.g. 65%->12% actual). Re-swept both gammas via
+    # scripts/dfs_ownership_gamma_sweep.py, out-of-sample, against every date
+    # with real contest ownership (6 dates for hitters, 5 for pitchers -- not
+    # just the 2 checked in the first pass):
+    #   hitter gamma 3.5->1.5: MAE improved on ALL 6 dates (e.g. 7/7: 4.42->3.69),
+    #   rank correlation FLAT throughout (Spearman unaffected -- softmax
+    #   temperature only changes concentration, not who's ranked ahead of whom,
+    #   so this was a pure calibration fix with no ranking cost).
+    #   pitcher_gamma: mixed by date (7/1, 7/2 prefer LOWER gamma; 6/30, 7/3, 7/7
+    #   prefer higher) -- the n-weighted pooled MAE across all 5 dates picks
+    #   7.0 (was 6.0), a smaller and less clean win than the hitter fix. Do not
+    #   re-tune pitcher_gamma off pooled Pearson alone -- it keeps climbing well
+    #   past the true MAE minimum because it's inflated by the single most-owned
+    #   pitcher each slate (see the external review's sub-15%-owned-only test,
+    #   the honest read for leverage decisions). Re-run the sweep script as
+    #   more slates accumulate -- this parameter is on thinner evidence than
+    #   the hitter gamma.
+    avg_team = (sum(team_proj.values()) / len(team_proj)) if team_proj else None
+    for p in pool:
+        val = p["proj"] / (p["salary"] / 1000.0) if p.get("salary") else 0.0
+        f = 1.0
+        if p["salary"] <= 3500 and p["proj"] > 3:        # min-priced value = punt chalk
+            f *= 1.25
+        elif p["salary"] >= 9000:                        # studs draw name ownership
+            f *= 1.08
+        if "P" not in p["pos"] and team_proj and avg_team:  # hitters: people stack good offenses
+            # NOTE: the team-stack LEVEL effect is real & huge (7/1: top stack 147% vs 37% median),
+            # but a stronger multiplier here FAILED verification on 6/30 anchors (MAE 4.3->7.7): it
+            # amplifies value-order within a stack, while the field orders by batting slot/name.
+            # Fixing needs a batting-order-aware term + more multi-slate ownership. Kept mild.
+            f *= max(0.7, min(1.4, team_proj.get(p["team"], avg_team) / avg_team))
+        if "P" not in p["pos"] and p.get("slot"):   # batting order: field heavily favors top-of-order.
+            f *= (SLOT_PA[p["slot"]] / 4.2) ** bo_exp   # cross-validated on 6/30 (222 players): MAE 3.82->3.65
+        p["_appeal"] = max(0.01, val * f)
+
+    from collections import defaultdict
+    grp = defaultdict(list)
+    for p in pool:
+        prim = next((s for s in ("P", "C", "1B", "2B", "3B", "SS", "OF") if s in p["pos"]), None)
+        if prim:
+            grp[prim].append(p)
+    for pos, players in grp.items():
+        g = pitcher_gamma if pos == "P" else gamma
+        denom = sum(x["_appeal"] ** g for x in players)
+        for x in players:
+            raw = _OWN_SLOTS[pos] * 100 * (x["_appeal"] ** g) / denom if denom else 0
+            x["own"] = round(min(raw, 65.0), 1)   # cap the chalkiest
+    return pool
+
+
+# === ACTUAL DK POINTS (for forward calibration: proj vs actual) =============
+def ip_to_outs(ip) -> int:
+    try:
+        w = int(float(ip)); frac = round((float(ip) - w) * 10)
+        return w * 3 + frac
+    except Exception:
+        return 0
+
+
+def actual_hitter_points(b: dict) -> float:
+    g = lambda k: b.get(k, 0) or 0
+    singles = g("hits") - g("doubles") - g("triples") - g("homeRuns")
+    return (3 * singles + 5 * g("doubles") + 8 * g("triples") + 10 * g("homeRuns")
+            + 2 * g("rbi") + 2 * g("runs") + 2 * g("baseOnBalls") + 2 * g("hitByPitch")
+            + 5 * g("stolenBases"))
+
+
+def actual_pitcher_points(p: dict, won: bool = False) -> float:
+    # DK MLB pitcher scoring: +2.25/IP, +2/K, +4 W, -2/ER, -0.6 per hit, BB AND
+    # hit batsman, +2.5 CG, +2.5 CG shutout (stacks with CG). The HBP-against
+    # term was missing until 2026-07-10 -- every graded pitcher actual ran
+    # ~0.2 pts/start high on average. (No-hitter +5 not computable from the
+    # boxscore stat dict; ~0 frequency.)
+    g = lambda k: p.get(k, 0) or 0
+    return (0.75 * ip_to_outs(p.get("inningsPitched", "0")) + 2 * g("strikeOuts")
+            + (4 if won else 0) - 2 * g("earnedRuns") - 0.6 * g("hits") - 0.6 * g("baseOnBalls")
+            - 0.6 * g("hitBatsmen") + 2.5 * g("completeGames") + 2.5 * g("shutouts"))
+
+
+# === SKILL RATES (leakage-safe: prior-season DK pts per PA, the differentiator) ===
+def skill_rates(season: int, min_pa: int = 80, cache_path: str | None = None) -> tuple[dict, float]:
+    """({playerId: dk_pts_per_PA}, league_avg_dkpp) from a full prior season.
+    Players below min_pa fall back to league average (unreliable small samples)."""
+    if cache_path and _os.path.exists(cache_path):
+        d = json.load(open(cache_path))
+        return {k: v for k, v in d["rates"].items()}, d["lg"]
+    url = (f"https://statsapi.mlb.com/api/v1/stats?stats=season&season={season}"
+           "&group=hitting&sportId=1&limit=3000&playerPool=All")
+    splits = _get(url)["stats"][0]["splits"]
+    rates, tot_pts, tot_pa = {}, 0.0, 0
+    for s in splits:
+        st = s["stat"]; pa = st.get("plateAppearances", 0) or 0
+        if pa < 1:
+            continue
+        pts = actual_hitter_points(st)
+        tot_pts += pts; tot_pa += pa
+        if pa >= min_pa:
+            rates[str(s["player"]["id"])] = pts / pa
+    lg = tot_pts / tot_pa if tot_pa else 1.4
+    if cache_path:
+        json.dump({"rates": rates, "lg": lg}, open(cache_path, "w"))
+    return rates, lg
+
+
+# === PRODUCTION HITTER MODEL (skill x opportunity x park x matchup x team-total) ===
+# Backtested out-of-sample on ~19k 2025 hitter-games: corr 0.16 & monotonic ranking,
+# vs the flat prop-only model's 0.02. Skill is the dominant signal; matchup/park/total
+# are smaller multipliers. team_total is production-only (not backtestable from cache).
+SLOT_PA = {1: 4.65, 2: 4.55, 3: 4.45, 4: 4.35, 5: 4.25, 6: 4.15, 7: 4.05, 8: 3.95, 9: 3.85}
+# Empirical starter PA by batting slot, HOME vs AWAY -- measured on 2,782
+# complete 2025 team-games (Apr 15-Jul 31, scripts/dfs_stack_shape_backtest.py).
+# Two real effects the flat SLOT_PA table missed: (1) away lineups get ~0.15-0.2
+# more PA per slot (the home team skips the bottom 9th when leading); (2) the
+# old table ran ~0.2-0.5 PA hot at every slot (it ignored pinch-hit truncation).
+# Backtested 2026-07-10 on 13,801 held-out 2025 hitter-games: switching the
+# projection's opportunity term to these tables cut MAE 5.565->5.467 and raised
+# corr 0.166->0.168, improving MAE on 56 of 57 test dates. SLOT_PA (above) is
+# retained for the OWNERSHIP model's batting-order term -- that term was
+# calibrated against real contest ownership with SLOT_PA's scale, and the field
+# doesn't think in home/away PA anyway.
+SLOT_PA_HOME = {1: 4.42, 2: 4.28, 3: 4.22, 4: 4.15, 5: 3.99, 6: 3.86, 7: 3.69, 8: 3.58, 9: 3.37}
+SLOT_PA_AWAY = {1: 4.59, 2: 4.50, 3: 4.41, 4: 4.32, 5: 4.17, 6: 4.02, 7: 3.88, 8: 3.69, 9: 3.54}
+LG_K9 = 8.6
+LG_ERA = 4.10
+
+# CASH-mode floor nudge (2026-07-09): a candidate "HR-rate = boom/bust" floor
+# metric was tested against real 2025 game logs (60 qualified hitters) and
+# FAILED -- raw std(game pts) vs hr_rate looked strong (+0.847) but that's
+# confounded by mean (power hitters simply score more); once normalized to
+# coefficient-of-variation the relationship vanished (-0.010), and bust-rate
+# (games <=1 pt) was mildly NEGATIVE (-0.21) -- the opposite of the boom/bust
+# hypothesis. Mean skill level alone strongly predicts consistency
+# (corr -0.55 CV, -0.67 bust-rate: better hitters are already more consistent,
+# which is why cash's existing pure proj-max isn't starting from zero). Walk
+# rate adds REAL signal beyond that: incremental_baseline_test(bust_rate,
+# mean_pts, bb_rate) -> incremental R2 +0.067, t=-2.80, significant at 5%
+# (n=60). A guaranteed way to reach base without contact (2 DK pts, plus
+# downstream run chances) is a genuine floor mechanism a low-BB hitter lacks.
+# Small, deliberately modest weight -- this is a real but secondary signal,
+# not a primary driver; do not raise this without re-validating on a bigger
+# game-log sample first.
+BB_FLOOR_WEIGHT = 2.0
+
+# Platoon by (batter side x opposing-starter hand) CELL -- league-average
+# calibration multipliers, NOT per-player splits. The per-player version was
+# killed twice (§4, §18: small-sample splits shrink outliers, lowering MAE
+# while HURTING corr). This version has no per-player noise: six population
+# cells, fit as actual/projected ratios residual to the home/away quality
+# pair below, on all 104 dates x 25,086 hitter-games of the 2025 lab window
+# (validated first on the held-out June-July test window as part of the combo:
+# MAE 5.456->5.390, corr 0.177->0.179, incremental t=3.48; then refit on the
+# full window for the shipped constants, standard post-validation practice).
+# The lefty swing is the textbook effect (LvL -6%, LvR +2%); the R cells are
+# nearly flat BECAUSE managers already platoon (population selection), and
+# S-vs-L is genuinely weak (many switch hitters are better from the left).
+# Unknown hand / missing cell -> 1.0 (neutral), so this degrades gracefully.
+PLATOON_CELL = {("L", "L"): 0.939, ("L", "R"): 1.020, ("R", "L"): 0.992,
+                ("R", "R"): 0.998, ("S", "L"): 0.944, ("S", "R"): 1.017}
+# Per-PA QUALITY by venue side, residual to the home/away PA tables (which
+# handle opportunity): home hitters project essentially clean (0.999) but away
+# hitters were over-projected 3.4% -- the away PA table gives them more trips
+# (home team skips the bottom 9th when leading) and this pairs that with the
+# real per-PA cost of batting on the road. Same fit/validation as above.
+HOME_QUALITY = {True: 0.999, False: 0.966}
+
+
+def pooled_skill_rates(seasons=(2024, 2025), min_pa: int = 120, cache_path: str | None = None,
+                       max_age: float | None = None, shrink_k: int | None = None,
+                       season_weights=None) -> tuple[dict, float]:
+    """Pooled DK-pts-per-PA over `seasons` (PA-weighted, so a partial current
+    season naturally gets proportionally less weight). Pass the CURRENT season
+    in the tuple to keep this from going stale as the year progresses (backtest
+    2026-07-08: MAE 5.604->5.577, corr +0.166->+0.181 including current-season
+    data vs frozen prior-seasons-only) -- then pass max_age so the disk cache
+    actually refreshes as more games are played, instead of freezing forever.
+
+    shrink_k: empirical-Bayes alternative to the min_pa hard cutoff -- EVERY
+    player gets rate = (pts + lg*K) / (pa + K), so a 40-PA rookie is shrunk
+    most of the way to league average instead of being thrown away entirely,
+    and a 1,500-PA veteran is barely touched. Backtested 2026-07-10 (13,801
+    held-out 2025 hitter-games): K=60 with the home/away PA + opp-ERA factors
+    gave the best test corr (0.177 vs 0.174 cutoff-based) at equal MAE; K was
+    picked on a separate April-May train window, not the test window. Passing
+    shrink_k=None keeps the legacy cutoff behavior (other callers/backtests).
+
+    season_weights: Marcel-style decay aligned with `seasons` (e.g. (0.5, 1.0,
+    1.0) to half-weight the two-seasons-back year). Backtested 2026-07-18 on
+    the 13,801-row held-out test window: w=(0.5, 1.0, 1.0) MAE 5.456->5.450,
+    corr flat -- small but consistent, and it ships as part of the combo that
+    was jointly significant (incremental t=3.48 over the §18 baseline).
+    None keeps flat PA-pooling."""
+    if cache_path and _os.path.exists(cache_path):
+        if max_age is None or _time.time() - _os.path.getmtime(cache_path) < max_age:
+            d = json.load(open(cache_path)); return d["rates"], d["lg"]
+    weights = dict(zip(seasons, season_weights)) if season_weights else {}
+    pts, pa = {}, {}
+    for yr in seasons:
+        try:
+            sp = _get(f"https://statsapi.mlb.com/api/v1/stats?stats=season&season={yr}"
+                      "&group=hitting&sportId=1&limit=3000&playerPool=All")["stats"][0]["splits"]
+        except Exception:
+            continue
+        w = weights.get(yr, 1.0)
+        for s in sp:
+            st = s["stat"]; a = st.get("plateAppearances", 0) or 0
+            if a < 1:
+                continue
+            pid = str(s["player"]["id"])
+            pts[pid] = pts.get(pid, 0) + w * actual_hitter_points(st); pa[pid] = pa.get(pid, 0) + w * a
+    tot_p = sum(pts.values()); tot_a = sum(pa.values())
+    lg = tot_p / tot_a if tot_a else 1.7
+    if shrink_k:
+        rates = {pid: (pts[pid] + lg * shrink_k) / (pa[pid] + shrink_k) for pid in pts}
+    else:
+        rates = {pid: pts[pid] / pa[pid] for pid in pts if pa[pid] >= min_pa}
+    if cache_path:
+        json.dump({"rates": rates, "lg": lg}, open(cache_path, "w"))
+    return rates, lg
+
+
+def park_runs(year: int) -> dict:
+    """{team_id(str): run index/100} from park_factors.json (3yr rolling). Prefers
+    the copy vendored into this repo's data/ (so it works on Streamlit Cloud where
+    the strikeouts path doesn't exist), then the local strikeouts file."""
+    _here = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+    pf = None
+    for _p in (_os.path.join(_here, "data", "park_factors.json"),
+               "/home/asr/Downloads/strikeouts/data/park_factors.json"):
+        try:
+            pf = json.load(open(_p)); break
+        except Exception:
+            continue
+    if pf is None:
+        return {}
+    return {str(v["main_team_id"]): int(v["index_runs"]) / 100.0
+            for v in pf.get(str(year), []) if v.get("index_runs")}
+
+
+def pitcher_k9(seasons, cache_path: str | None = None, max_age: float | None = None) -> dict:
+    """{pid(str): K/9} for opposing-SP matchup, pooled (IP-weighted) across
+    `seasons`. Accepts a single season int (back-compat) or a tuple/list --
+    pass the current season alongside the prior one so this doesn't go stale
+    (see pooled_skill_rates for the validated backtest behind this)."""
+    seasons = (seasons,) if isinstance(seasons, int) else tuple(seasons)
+    if cache_path and _os.path.exists(cache_path):
+        if max_age is None or _time.time() - _os.path.getmtime(cache_path) < max_age:
+            return json.load(open(cache_path))
+    k, outs = {}, {}
+    for season in seasons:
+        try:
+            sp = _get(f"https://statsapi.mlb.com/api/v1/stats?stats=season&season={season}"
+                     "&group=pitching&sportId=1&limit=2000&playerPool=All")["stats"][0]["splits"]
+        except Exception:
+            continue
+        for s in sp:
+            st = s["stat"]
+            try:
+                ipf = float(st.get("inningsPitched"))
+            except (TypeError, ValueError):
+                continue
+            pid = str(s["player"]["id"])
+            k[pid] = k.get(pid, 0) + (st.get("strikeOuts", 0) or 0)
+            outs[pid] = outs.get(pid, 0) + ipf * 3
+    out = {pid: 9 * k[pid] / (outs[pid] / 3.0) for pid in k if outs[pid] / 3.0 >= 30}
+    if cache_path:
+        json.dump(out, open(cache_path, "w"))
+    return out
+
+
+def pitcher_era(seasons, cache_path: str | None = None, max_age: float | None = None) -> dict:
+    """{pid(str): ERA} pooled (IP-weighted) across `seasons`, min 30 IP -- the
+    opposing starter's run-prevention beyond what K/9 captures. Backtested
+    2026-07-10 (w_era=0.2 in project_hitter_skill): MAE 5.467->5.458 and corr
+    0.168->0.174 both improved on 13,801 held-out 2025 hitter-games."""
+    seasons = (seasons,) if isinstance(seasons, int) else tuple(seasons)
+    if cache_path and _os.path.exists(cache_path):
+        if max_age is None or _time.time() - _os.path.getmtime(cache_path) < max_age:
+            return json.load(open(cache_path))
+    er, outs = {}, {}
+    for season in seasons:
+        try:
+            sp = _get(f"https://statsapi.mlb.com/api/v1/stats?stats=season&season={season}"
+                     "&group=pitching&sportId=1&limit=2000&playerPool=All")["stats"][0]["splits"]
+        except Exception:
+            continue
+        for s in sp:
+            st = s["stat"]
+            try:
+                ipf = float(st.get("inningsPitched"))
+            except (TypeError, ValueError):
+                continue
+            pid = str(s["player"]["id"])
+            er[pid] = er.get(pid, 0) + (st.get("earnedRuns", 0) or 0)
+            outs[pid] = outs.get(pid, 0) + ipf * 3
+    out = {pid: 9 * er[pid] / (outs[pid] / 3.0) for pid in er if outs[pid] / 3.0 >= 30}
+    if cache_path:
+        json.dump(out, open(cache_path, "w"))
+    return out
+
+
+def team_pitcher_stats(team_id, seasons, cache_path: str | None = None, max_age: float | None = None) -> list:
+    """[{pid, ip, k, gs, g}] for every pitcher on a team's 40-man roster, IP/K
+    pooled across `seasons`. One roster + N per-pitcher calls, cached per team
+    so the (expensive) pull happens once, then bullpen_k9() below can be
+    recomputed cheaply in-memory for whatever starter each matchup excludes."""
+    seasons = (seasons,) if isinstance(seasons, int) else tuple(seasons)
+    if cache_path and _os.path.exists(cache_path):
+        if max_age is None or _time.time() - _os.path.getmtime(cache_path) < max_age:
+            return json.load(open(cache_path))
+    try:
+        roster = _get(f"https://statsapi.mlb.com/api/v1/teams/{team_id}/roster?rosterType=40Man")["roster"]
+    except Exception:
+        return []
+    out = []
+    for p in roster:
+        if p["position"]["type"] != "Pitcher":
+            continue
+        pid = p["person"]["id"]
+        ip = k = gs = g = 0.0
+        for season in seasons:
+            try:
+                st = _get(f"https://statsapi.mlb.com/api/v1/people/{pid}/stats?stats=season"
+                         f"&group=pitching&season={season}")["stats"][0]["splits"][0]["stat"]
+            except Exception:
+                continue
+            try:
+                ip += float(st.get("inningsPitched") or 0)
+            except (TypeError, ValueError):
+                continue
+            k += st.get("strikeOuts", 0) or 0
+            gs += st.get("gamesStarted", 0) or 0
+            g += st.get("gamesPitched", 0) or 0
+        if ip:
+            out.append({"pid": pid, "ip": ip, "k": k, "gs": gs, "g": g})
+    if cache_path:
+        json.dump(out, open(cache_path, "w"))
+    return out
+
+
+def inactive_players(team_id, cache_path: str | None = None, max_age: float | None = None) -> set:
+    """{norm(name)} for every player on a team's 40-man roster who is NOT on
+    the active roster right now -- IL (any duration), optioned to minors,
+    restricted, etc. Confirmed live 2026-07-10 against five real cases
+    (Judge D10, Rodon D15, Holmes/Estevez/Marsh D60, several RM = Reassigned
+    to Minors): all correctly on 40Man but absent from active. The roster
+    `status` text field can NOT be trusted at face value -- checked live
+    against a player specifically reported to be on IL and it still read
+    {"code": "A", "description": "Active"} (status can lag reality) -- so
+    this checks SET MEMBERSHIP (40Man minus active) instead, which is the
+    signal that actually held up across the five confirmed real examples.
+
+    This is what actually needs filtering out of build_slate's pool: when
+    today's real lineup isn't posted yet, lineups_for_date's projected
+    fallback (_team_recent_lineup) reuses a player's most recent lineup slot
+    -- if that player has since gone on IL or been optioned, the projection
+    doesn't know and still includes them."""
+    if cache_path and _os.path.exists(cache_path):
+        if max_age is None or _time.time() - _os.path.getmtime(cache_path) < max_age:
+            return set(json.load(open(cache_path)))
+    try:
+        active_ids = {p["person"]["id"] for p in _get(
+            f"https://statsapi.mlb.com/api/v1/teams/{team_id}/roster?rosterType=active")["roster"]}
+        full = _get(f"https://statsapi.mlb.com/api/v1/teams/{team_id}/roster?rosterType=40Man")["roster"]
+    except Exception:
+        return set()
+    out = {norm(p["person"]["fullName"]) for p in full if p["person"]["id"] not in active_ids}
+    if cache_path:
+        json.dump(sorted(out), open(cache_path, "w"))
+    return out
+
+
+def player_hands(pids, cache_path: str | None = None) -> dict:
+    """{pid(str): {"bat": "L|R|S", "throw": "L|R"}} via bulk /people calls,
+    disk-cached additively and permanently (handedness doesn't change).
+    Feeds the PLATOON_CELL factor in project_hitter_skill: batter side for
+    hitters, throwing hand for opposing starters. Unknown ids resolve to {}
+    entries so they're not refetched every build."""
+    cached = {}
+    if cache_path and _os.path.exists(cache_path):
+        try:
+            cached = json.load(open(cache_path))
+        except Exception:
+            cached = {}
+    todo = sorted({str(p) for p in pids if p and str(p) not in cached})
+    for i in range(0, len(todo), 100):
+        chunk = todo[i:i + 100]
+        try:
+            ppl = _get("https://statsapi.mlb.com/api/v1/people?personIds=" + ",".join(chunk))["people"]
+        except Exception:
+            continue
+        got = {str(p["id"]): {"bat": (p.get("batSide") or {}).get("code"),
+                              "throw": (p.get("pitchHand") or {}).get("code")} for p in ppl}
+        for pid in chunk:
+            cached[pid] = got.get(pid, {})
+    if cache_path and todo:
+        json.dump(cached, open(cache_path, "w"))
+    return cached
+
+
+def bullpen_k9(pitcher_stats: list, exclude_pid=None) -> float:
+    """K/9 pooled across a team's RELIEVERS (gamesStarted/gamesPitched < 0.5),
+    excluding tonight's actual/probable starter. Backtested 2026-07-08: blending
+    the opposing SP's K9 60/40 with this (a hitter sees the bullpen for roughly
+    the back third of a game) reduced hitter MAE 5.577->5.547 with correlation
+    flat (0.181->0.179) on 5,146 held-out 2025 hitter-games -- unlike the
+    platoon signal tested the same way, this one didn't cost ranking quality."""
+    tot_k = tot_outs = 0.0
+    for p in pitcher_stats:
+        if p["pid"] == exclude_pid or p["ip"] < 15:
+            continue
+        if p["gs"] / (p["g"] or 1) < 0.5:
+            tot_k += p["k"]; tot_outs += p["ip"] * 3
+    return (9 * tot_k / (tot_outs / 3.0)) if tot_outs else LG_K9
+
+
+def project_hitter_skill(skill: float, slot: int, park: float = 1.0,
+                         opp_k9: float | None = None, team_total: float | None = None,
+                         w_match: float = 0.3, home: bool | None = None,
+                         opp_era: float | None = None, w_era: float = 0.2,
+                         bhand: str | None = None, opp_hand: str | None = None) -> float:
+    """DK fantasy points = skill(DKpts/PA) x PA(slot,home/away) x park x matchup x team-env.
+
+    home=True/False selects the empirical home/away PA table (see SLOT_PA_HOME
+    comment for the backtest) AND applies the HOME_QUALITY per-PA calibration
+    pair; None keeps the legacy flat table (back-compat for callers that don't
+    know venue). opp_era adds the opposing starter's run-prevention to the
+    matchup beyond K/9 -- backtested 2026-07-10 on the same 13,801 held-out
+    hitter-games: MAE 5.467->5.458 AND corr 0.168->0.174 both improved at
+    w_era=0.2 (train-window pick; 0.3 bought MAE but not corr).
+
+    bhand/opp_hand (batter side, opposing starter's throwing hand) apply the
+    PLATOON_CELL league-average multiplier -- see its comment for the backtest;
+    either side missing means neutral 1.0, so callers without hand data get
+    exactly the old behavior."""
+    if home is True:
+        pa = SLOT_PA_HOME.get(slot, 4.0)
+    elif home is False:
+        pa = SLOT_PA_AWAY.get(slot, 4.1)
+    else:
+        pa = SLOT_PA.get(slot, 4.2)
+    of = 1.0
+    if opp_k9:
+        of = min(1.18, max(0.82, 1 - w_match * (opp_k9 / LG_K9 - 1)))
+    rf = 1.0
+    if opp_era:
+        rf = min(1.15, max(0.85, 1 + w_era * (opp_era / LG_ERA - 1)))
+    tf = 1.0
+    if team_total:
+        tf = min(1.30, max(0.75, team_total / TEAM_TOTAL_AVG))
+    hq = HOME_QUALITY[home] if home is not None else 1.0
+    pf = PLATOON_CELL.get((bhand, opp_hand), 1.0) if bhand and opp_hand else 1.0
+    return round(skill * pa * park * of * rf * tf * hq * pf, 1)
+
+
+def _team_recent_lineup(team_id, before_date: str) -> list:
+    """A team's most-recent posted batting order (last Final game in the prior ~2
+    weeks) -> [(player_id, name, slot)]. Naturally excludes IL players (they
+    weren't in that lineup); the residual risk is a same-day rest/scratch."""
+    import datetime as _d
+    d0 = _d.date.fromisoformat(before_date)
+    sch = _get(f"https://statsapi.mlb.com/api/v1/schedule?sportId=1&teamId={team_id}"
+               f"&startDate={(d0 - _d.timedelta(days=14)).isoformat()}&endDate={(d0 - _d.timedelta(days=1)).isoformat()}")
+    games = [(g.get("gameDate", ""), g["gamePk"]) for dd in sch.get("dates", []) for g in dd.get("games", [])
+             if g.get("status", {}).get("abstractGameState") == "Final"]
+    if not games:
+        return []
+    try:
+        box = _get(f"https://statsapi.mlb.com/api/v1/game/{max(games)[1]}/boxscore")
+    except Exception:
+        return []
+    for side in ("home", "away"):
+        t = box["teams"][side]
+        if str(t["team"]["id"]) == str(team_id):
+            starters = [(pl["person"]["id"], pl["person"]["fullName"], int(pl["battingOrder"]) // 100)
+                        for pl in t["players"].values()
+                        if pl.get("battingOrder") and int(pl["battingOrder"]) % 100 == 0]
+            return sorted(starters, key=lambda x: x[2])
+    return []
+
+
+_NORMAL_GAME_STATES = {"Final", "In Progress", "Pre-Game", "Completed Early", "Scheduled",
+                      "Warmup", "Manager Challenge", "Review"}
+# statsapi's team.abbreviation doesn't always match DK's teamAbbreviation --
+# confirmed live 2026-07-09: statsapi says "AZ" for Arizona, DK says "ARI".
+# team_game_status()'s output is keyed to match DK (all_teams/pool "team"
+# field), since that's what callers cross-reference it against.
+_STATSAPI_TO_DK_ABBR = {"AZ": "ARI"}
+
+_team_abbr_cache: dict[str, str] | None = None
+
+
+def team_id_to_abbr() -> dict[str, str]:
+    """{team_id(str): DK-style abbreviation} for all 30 MLB teams -- already
+    normalized through _STATSAPI_TO_DK_ABBR. Effectively static for the life
+    of a running process (teams don't get renamed mid-season), so this is
+    memoized in-process rather than given cache_path/max_age disk-cache
+    plumbing like the other statsapi fetchers here -- the data's cheap and
+    doesn't need to survive a process restart the way skill rates etc. do.
+
+    Found auditing this module for redundant network calls: team_abbrev_map()
+    (edge/dfs_run.py) and team_game_status() below each independently
+    fetched /teams?sportId=1 on EVERY single build_slate() call, for a
+    resource that never changes intra-build. season_hitting() also used to
+    re-fetch it (guarded by its own day-long disk cache, so a lower-priority
+    duplicate, but still redundant on a cold cache). All three now share
+    this one in-process fetch."""
+    global _team_abbr_cache
+    if _team_abbr_cache is None:
+        _team_abbr_cache = {str(t["id"]): _STATSAPI_TO_DK_ABBR.get(t["abbreviation"], t["abbreviation"])
+                            for t in _get("https://statsapi.mlb.com/api/v1/teams?sportId=1")["teams"]}
+    return _team_abbr_cache
+
+
+def team_game_status(date: str) -> dict:
+    """{team_abbr: "" or the game's detailedState} for every team playing on
+    `date`. Empty string = normal (final/in-progress/upcoming as expected).
+    Anything else (e.g. "Postponed", "Suspended") is a real signal worth a
+    warning before building around that team.
+
+    CAUGHT LIVE 2026-07-09: a postponed game's abstractGameState is
+    misleadingly "Final" (matches a normal completed game) -- only
+    detailedState actually says "Postponed". Checking abstractGameState alone
+    (as the doubleheader-authoritative-game logic does) would silently miss
+    this, so this function checks detailedState specifically. Allowlist, not
+    denylist -- an unrecognized detailedState is a signal we haven't seen
+    before and should still be surfaced, not silently treated as normal.
+
+    This does NOT know about a DK-specific "won't count for this contest"
+    designation -- that's a contest-scoring rule DK doesn't expose via any
+    free API, so it can only be a manual override (see build_slate's
+    exclude_teams). This catches the more common real-world cause (the game
+    itself was postponed/suspended), not the DK-contest-rules case
+    specifically.
+
+    CAUGHT LIVE 2026-07-10, prompted by the user asking "is it because the
+    slate is over": the plain (unhydrated) /schedule response's embedded
+    team objects have NO "abbreviation" field at all -- confirmed for every
+    team, every game, that date (only id/name/link). Extracting abbreviation
+    straight from the schedule response (even defensively) silently returned
+    "" for every team, every time -- this function had never actually worked.
+    Fixed by resolving team ID -> abbreviation via the separate, reliable
+    /teams endpoint (team_id_to_abbr() above, shared with team_abbrev_map()
+    in dfs_run.py for exactly this reason) instead of trusting the schedule
+    payload to carry it."""
+    out = {}
+    try:
+        s = _get(f"https://statsapi.mlb.com/api/v1/schedule?sportId=1&date={date}")
+    except Exception:
+        return out
+    try:
+        id_to_abbr = team_id_to_abbr()
+    except Exception:
+        return out
+    for d in s.get("dates", []):
+        for g in d.get("games", []):
+            try:
+                # regular season only -- an All-Star/exhibition entry (gameType
+                # "A" etc, confirmed real: 2026-07-14) has "AL"/"NL" in place of
+                # a real team abbreviation, which isn't a crash but would
+                # pollute this dict with bogus non-DK-team keys.
+                if g.get("gameType", "R") != "R":
+                    continue
+                detail = g.get("status", {}).get("detailedState", "")
+                flag = "" if detail in _NORMAL_GAME_STATES else detail
+                for side in ("home", "away"):
+                    team_id = str((g.get("teams", {}).get(side, {}).get("team", {}) or {}).get("id", ""))
+                    # already DK-normalized by team_id_to_abbr()
+                    abbr = id_to_abbr.get(team_id)
+                    if not abbr:
+                        continue
+                    # if a team's already flagged from another game that date, keep the flag
+                    if flag or abbr not in out:
+                        out[abbr] = flag
+            except Exception:
+                # one malformed game entry (any unexpected schedule shape)
+                # must not take down the whole function -- skip it and keep going.
+                continue
+    return out
+
+
+def lineups_for_date(date: str, project: bool = True) -> dict:
+    """{(team_id, norm_name): {id, name, slot, team_id, park_team_id, opp_pitcher_id,
+    game, confirmed}}. Confirmed starters from statsapi; if a team's lineup isn't
+    posted yet and project=True, fill a PROJECTED order from its most-recent game
+    (confirmed=False), so you can target a team before its official lineup drops.
+
+    Keyed by (team_id, name), not name alone -- confirmed live 2026-07-12: two
+    different real active MLB players are both named "Max Muncy" (LAD and
+    ATH) on the same date. A bare-name key meant whichever team's entry was
+    processed last silently overwrote the other in this dict; build_slate()
+    then joined that squashed entry against a SLATE-SCOPED salaries dict by
+    name alone, producing a pool entry with the correct DK-priced player's
+    salary but the WRONG player's team/opponent/batting-slot/skill data
+    merged in. Team-scoping the key lets build_slate cross-check team
+    consistency at the join instead of trusting a 1:1 name correspondence
+    that doesn't always hold."""
+    s = _get(f"https://statsapi.mlb.com/api/v1/schedule?sportId=1&date={date}&hydrate=lineups,probablePitcher")
+    # regular season only -- an All-Star/exhibition entry (gameType "A" etc,
+    # confirmed real: 2026-07-14) uses "AL"/"NL" pseudo-teams that won't
+    # collide with real team ids, but there's no reason to process it at all.
+    games = [g for d in s.get("dates", []) for g in d.get("games", []) if g.get("gameType", "R") == "R"]
+
+    # Doubleheaders: a team can appear in 2 games the same date. Without this,
+    # a finished game 1's CONFIRMED lineup gets keyed by player name same as
+    # game 2's, and once game 1 is Final its stale entry wins (and blocks the
+    # projected-fallback dedup guard below) even though game 2 hasn't posted
+    # yet and may start someone else. Pick one authoritative game per team:
+    # whichever isn't Final yet, so a still-relevant game is never shadowed by
+    # an already-completed earlier one; if both are Final, use the later one.
+    by_team = {}
+    for g in games:
+        state = g.get("status", {}).get("abstractGameState", "")
+        for side in ("home", "away"):
+            tid = g["teams"][side]["team"]["id"]
+            by_team.setdefault(tid, []).append((g.get("gameDate", ""), state, g["gamePk"]))
+    authoritative = {}
+    for tid, lst in by_team.items():
+        lst.sort()
+        not_final = [x for x in lst if x[1] != "Final"]
+        authoritative[tid] = (not_final[0][2] if not_final else lst[-1][2])
+
+    out = {}
+    for g in games:
+        lu = g.get("lineups", {})
+        home_id = g["teams"]["home"]["team"]["id"]
+        away_id = g["teams"]["away"]["team"]["id"]
+        hpp = (g["teams"]["home"].get("probablePitcher") or {}).get("id")
+        app = (g["teams"]["away"].get("probablePitcher") or {}).get("id")
+        for key, team_id, opp_pid, opp_team_id in (("homePlayers", home_id, app, away_id),
+                                                    ("awayPlayers", away_id, hpp, home_id)):
+            if authoritative.get(team_id) != g["gamePk"]:
+                continue
+            players = lu.get(key) or []
+            if players:
+                for i, pl in enumerate(players[:9]):
+                    out[(team_id, norm(pl["fullName"]))] = {"id": pl["id"], "name": pl["fullName"], "slot": i + 1,
+                                                 "team_id": team_id, "park_team_id": home_id,
+                                                 "opp_pitcher_id": opp_pid, "opp_team_id": opp_team_id,
+                                                 "game": g["gamePk"], "confirmed": True}
+            elif project:
+                for pid, name, slot in _team_recent_lineup(team_id, date):
+                    if (team_id, norm(name)) not in out:
+                        out[(team_id, norm(name))] = {"id": pid, "name": name, "slot": slot, "team_id": team_id,
+                                           "park_team_id": home_id, "opp_pitcher_id": opp_pid,
+                                           "opp_team_id": opp_team_id, "game": g["gamePk"], "confirmed": False}
+    return out
+
+
+import datetime as _dt
+# slate suffixes that aren't standard salary-cap Classic (skip when resolving by name)
+_NONCLASSIC = ("snake", "tiers", "home runs", "@")
+
+
+def list_slate_names(groups: list[dict], date: str | None = None) -> list[tuple]:
+    """(name, id, startZ, games) for priced-ish Classic slates, optionally for
+    a date. `date` is matched against the slate's ET (America/New_York)
+    calendar date, not a naive UTC StartDate string prefix -- a late slate
+    (Night/Late Night) commonly starts after 8pm ET, which is already
+    tomorrow in UTC. A naive `StartDate[:10] == date` comparison would
+    silently drop that slate from "today"'s listing even though it's
+    unambiguously tonight's slate to the person building it. Found live
+    2026-07-18 investigating a real slate-mismatch report, alongside the
+    app's dropdown passing a bare slate NAME instead of its numeric id (see
+    app.py) -- together those meant two same-named slates at different
+    times (or even different days) were functionally indistinguishable no
+    matter which one got clicked."""
+    from zoneinfo import ZoneInfo
+    import datetime as _dt2
+    out = []
+    for g in groups:
+        suf = (g.get("ContestStartTimeSuffix") or "").strip().strip("()")
+        if any(k in suf.lower() for k in _NONCLASSIC):
+            continue
+        start = g.get("StartDate") or ""
+        if date:
+            if len(start) < 16:
+                continue
+            try:
+                y, mo, d = int(start[0:4]), int(start[5:7]), int(start[8:10])
+                h, mi = int(start[11:13]), int(start[14:16])
+                dt_utc = _dt2.datetime(y, mo, d, h, mi, tzinfo=ZoneInfo("UTC"))
+                et_date = dt_utc.astimezone(ZoneInfo("America/New_York")).date().isoformat()
+            except (ValueError, IndexError):
+                et_date = start[:10]
+            if et_date != date:
+                continue
+        out.append((suf or "Main", g.get("DraftGroupId"), start[11:16], g.get("GameCount")))
+    return sorted(out, key=lambda x: x[2])
+
+
+def resolve_draft_group(spec, date: str | None = None) -> dict | None:
+    """Resolve a draft group from a numeric id OR a slate name (Main/Early/Turbo/
+    Night/Afternoon). Among same-name slates picks the soonest UPCOMING one;
+    among THOSE tied on start time, prefers the one with MORE games -- DK
+    sometimes posts a same-named/same-time duplicate with a smaller game
+    count (confirmed live 2026-07-11: two "Main" groups at the identical
+    StartDate, 6 games vs 14), and without this the tie-break was whatever
+    order the API happened to return, not a principled choice. Mirrors
+    main_slate_group's existing tie-break for the same reason."""
+    groups = mlb_draft_groups()
+    if str(spec).strip().isdigit():
+        return next((g for g in groups if g.get("DraftGroupId") == int(spec)), None)
+    name = str(spec).strip().lower()
+    if name in ("main", "classic", "full", ""):
+        name = ""
+
+    def suf(g):
+        return (g.get("ContestStartTimeSuffix") or "").strip().strip("()").lower()
+
+    cands = [g for g in groups if suf(g) == name]
+    if date:
+        cands = [g for g in cands if (g.get("StartDate") or "")[:10] == date] or cands
+    if not cands:
+        return None
+    now = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+    future = [g for g in cands if (g.get("StartDate") or "") >= now]
+    return sorted(future or cands,
+                  key=lambda g: (g.get("StartDate") or "", -(g.get("GameCount") or 0)))[0]

@@ -1,0 +1,1683 @@
+"""Detection: two/three-way arbitrage, middles, and +EV against a sharp anchor."""
+from __future__ import annotations
+
+import hashlib
+import logging
+import math
+from dataclasses import dataclass, field, asdict
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
+
+from .models import Board, EventMeta, GroupKey, MarketGroup, Quote, utcnow
+from .normalize import is_spread_market, side_label
+from . import oddsmath as om
+
+log = logging.getLogger("arb.engine")
+
+ET = ZoneInfo("America/New_York")
+
+# How much TIGHTER than a book's own main-line overround a far alternate rung
+# has to be priced before it reads as a rung the book has stopped repricing.
+# Only used where the ladder is too flat or too short to give a center to
+# measure instead -- see stale_alt_ladders.
+#
+# Bracketed by the two cases it has to tell apart, both real: the DraftKings
+# NCAAF ladder that kept serving 52.5 after the total moved to 62.5 priced
+# that rung at +0.0013 against its own main, while the tightest genuine far
+# rung across 1,263 live DraftKings NFL ones sat at +0.0129. Anywhere in
+# between separates them; the midpoint is not a number worth tuning.
+STALE_VIG_MARGIN = 0.005
+
+
+@dataclass
+class Leg:
+    book: str
+    side: str
+    label: str
+    decimal: float
+    american: str
+    point: float | None
+    stake: float = 0.0
+    payout: float = 0.0
+    link: str | None = None
+    age_seconds: float = 0.0
+    limit: float | None = None
+    boost_pct: float = 0.0        # profit boost applied to THIS leg, 0 = none
+    raw_decimal: float = 0.0      # the book's own price, before any boost
+    # True when this leg's own book quotes an alternate rung far from that
+    # SAME book's current main line while still priced like one -- see
+    # stale_alt_ladders. Never true for the main line itself.
+    off_main_line: bool = False
+    # The main point off_main_line was measured against, on the SAME axis as
+    # this leg's own `point` -- so an away spread leg carries the away-signed
+    # main, and the warning below reads as one number against another rather
+    # than as two with opposite signs. The board's main_points registry keys
+    # on the raw home-axis group point, which is what the LOOKUP uses; the
+    # negation happens after it, in _leg. Doing it the other way round --
+    # looking the main up through the already-signed `point` -- would query
+    # the wrong sign entirely and simply miss.
+    main_line: float | None = None
+    # True when off_main_line came from DraftKings' own data contradicting
+    # itself (its alternate ladder's "main" tag disagrees with its Game
+    # market), False when it was inferred from this rung's own vig looking
+    # too tight for how far it sits from main. See stale_alt_ladders.
+    stale_confirmed: bool = False
+
+
+@dataclass
+class Boost:
+    """One sportsbook profit-boost token.
+
+    Boosts are what make two-book arbitrage routinely available rather than
+    rare. A -110/-110 market sums to 1.048 -- the 4.8% is the vig, and no
+    amount of shopping between two books removes it. A 50% boost on one leg
+    prices it at 2.364 instead of 1.909, and the same market now sums to
+    0.947: a 5.6% guaranteed profit. The boost is not an edge on top of an
+    arb, it is what creates the arb.
+
+    Three constraints decide whether one is usable, and all three change the
+    answer, so none of them is optional:
+
+      * it applies to ONE bet slip, so exactly one leg of the pair
+      * it has a max stake (typically $25-$50), which caps the whole position
+        rather than just that leg -- the hedge is sized off it
+      * it is usually restricted to a sport, and sometimes a market type
+      * and often to ONE GAME, which is narrower than all of those
+    """
+    book: str
+    pct: float                                                  # 0.5 == +50%
+    max_stake: float = 10.0       # a conservative floor; raise per token
+    sports: list[str] = field(default_factory=list)             # empty == any
+    # Event ids the token is good on; empty == any game. The narrowest scope
+    # a book issues and the one it issues most: "50% profit boost on Ohio
+    # State vs Michigan" is a single-game token, and a search that ignores
+    # that reports boosted arbitrages in games the token cannot be spent on.
+    # Same failure as requires_parlay and min_decimal -- a number on screen
+    # for a bet the book will refuse -- so it is filtered here rather than
+    # left to the reader to check game by game.
+    events: list[str] = field(default_factory=list)             # empty == any
+    markets: list[str] = field(default_factory=list)            # empty == any
+    sides: list[str] = field(default_factory=list)              # empty == any
+    min_decimal: float = 1.0        # "Min Total Odds of -200" -> 1.5
+    requires_parlay: bool = False
+    # When the token dies. An event starting after this cannot be boosted --
+    # tokens are dated ("valid on Tennis on 8/30") and a match two days out
+    # is outside the offer no matter how good the price. Without this the
+    # scanner reported a Tuesday match as a boosted arbitrage against a token
+    # expiring that night: a bet that cannot be placed.
+    expires_at: datetime | None = None
+    label: str = ""
+
+    def applies_to(self, book: str, sport_key: str, market: str,
+                   side: str | None = None, decimal: float | None = None,
+                   event_start: datetime | None = None,
+                   event_id: str | None = None) -> bool:
+        # A parlay-only token cannot price a single leg. Books hand these out
+        # alongside straight-bet boosts and they look identical in the app
+        # ("25% WNBA boost"), but only one of them can be hedged: a two-leg
+        # arbitrage needs each side placed as its own straight bet. Treating
+        # one as usable reports a profit that cannot be placed.
+        if self.requires_parlay:
+            return False
+        if self.pct <= 0.0 or book != self.book:
+            return False
+        if self.sports and sport_key not in self.sports:
+            return False
+        # STRICT on a missing event_id, unlike `sides`, `decimal` and
+        # `expires_at` above and below, which all treat None as "the caller
+        # has nothing to say, so do not apply this rule".
+        #
+        # The difference is what None means in each case. Those three can be
+        # unset on a config-defined token or absent from an older snapshot,
+        # where refusing would silently switch every boost off. `events` is
+        # only ever non-empty because someone deliberately said "this token
+        # is for THIS game" -- and every caller that can name a game does.
+        # So an unknown event_id here is not "no opinion", it is "cannot
+        # confirm this is the right game", and confirming is the entire job:
+        # matching anyway would report a boosted arbitrage in a game the
+        # token cannot be spent on, which is the defect this field exists to
+        # remove.
+        if self.events and (event_id is None or event_id not in self.events):
+            return False
+        if self.markets and market not in self.markets:
+            return False
+        # Which SIDE, not just which market. DraftKings' "Batter Props
+        # Milestones" are the over-only threshold ladders (1+, 2+, 3+); the
+        # two-sided O/U tabs are a separate offer the token is not valid on.
+        # Ignoring this lets the hedge maths pick the DK *under* as the leg to
+        # boost -- which it prefers, and which cannot actually be placed.
+        if self.sides and side is not None and side not in self.sides:
+            return False
+        # Nearly every token carries a minimum-odds floor ("Min Total Odds of
+        # -200"). A leg priced shorter does not qualify, and boosting it
+        # reports a profit the book will refuse at the slip.
+        if decimal is not None and float(decimal) < self.min_decimal:
+            return False
+        if self.expires_at and event_start is not None and event_start > self.expires_at:
+            return False
+        return True
+
+    def describe(self) -> str:
+        return self.label or f"{self.pct:.0%} boost on {self.book} (max ${self.max_stake:g})"
+
+
+@dataclass
+class Opportunity:
+    kind: str                     # arb | middle | ev
+    fingerprint: str
+    sport_key: str
+    sport_title: str
+    event_id: str
+    matchup: str
+    commence_time: datetime
+    market: str
+    subject: str | None
+    description: str
+    legs: list[Leg]
+    profit_pct: float             # arb: guaranteed %; middle: % if it hits; ev: edge %
+    stake_total: float = 0.0
+    profit_abs: float = 0.0
+    max_loss_pct: float = 0.0     # middles only
+    breakeven_hit_pct: float = 0.0    # how often it must land to break even
+    hit_values: list[int] = field(default_factory=list)   # results winning BOTH legs
+    push_values: list[int] = field(default_factory=list)  # results winning one, pushing one
+    pushes: bool = False              # a whole-number line returns a stake
+    middle_window: tuple[float, float] | None = None
+    fair_prob: float | None = None    # ev: devigged fair prob; middle: P(window)
+    # The one number that ranks all three kinds against each other. profit_pct
+    # does not: for an arb it is guaranteed, for a middle it is what you get
+    # ONLY if it lands, and a middle's headline (+90-130%) therefore buries
+    # every real arbitrage when the list is sorted on it. Expected return puts
+    # a guaranteed 2% above a 130%-if-it-lands that hits 1.5% of the time,
+    # which is the order you would actually bet in.
+    expected_pct: float | None = None
+    # The guaranteed-worst-case and best-case % on THIS position, in the same
+    # units for every kind: an arb's floor and ceiling are ~equal (a hedge
+    # pays the same either way, up to rounding); a middle's floor is what a
+    # miss still nets (negative unless it is a free middle) and its ceiling
+    # is profit_pct, the payout if the window lands; +EV bets carry neither,
+    # since there is no hedge to guarantee a floor. This is what a boost
+    # panel comparing many opportunities at once ranks on, rather than
+    # profit_pct alone, whose meaning otherwise differs by kind.
+    floor_pct: float | None = None
+    ceiling_pct: float | None = None
+    # Probability (0-100) of landing on the WORST outcome: 0 for an arb or a
+    # free middle (there is no bad outcome), 100x(1-P(hit)) for an ordinary
+    # middle, 100xP(gap) for a gap. None when unmeasured -- which must sort as
+    # WORSE than any measured risk, not better, the same principle
+    # `expected_pct`'s None-handling already uses for a middle with no CDF.
+    # This is the field a "smallest risk" ranking (e.g. a casino-comps view)
+    # sorts on, since profit_pct's meaning otherwise differs by kind.
+    risk_pct: float | None = None
+    # A middle whose worst case is still a profit -- it is a straight
+    # arbitrage AND carries the middle's upside if the window lands. No
+    # downside, a higher ceiling than the arb alone: strictly better than an
+    # ordinary middle, and the app ranks these first regardless of size.
+    free_middle: bool = False
+    # The guaranteed floor when free_middle is True (missing the window still
+    # profits by this much). max_loss_pct clamps a negative cost to 0 for the
+    # "risk" reading everywhere else, which is right for THAT purpose but
+    # would otherwise erase the one number that says how large the guarantee
+    # actually is here.
+    free_middle_floor_pct: float | None = None
+    kelly_stake: float | None = None  # ev only
+    anchor_book: str | None = None
+    boost: str | None = None      # description of the boost this relies on
+    max_age_seconds: float = 0.0
+    warnings: list[str] = field(default_factory=list)
+    found_at: datetime = field(default_factory=utcnow)
+    # True when any leg is on a drifted alternate ladder (see Leg.off_main_line
+    # / stale_alt_ladders). Hidden from the default view -- the sidebar has an
+    # override to show these anyway, since the number is real, just suspect.
+    stale_alt_line: bool = False
+
+    def to_dict(self) -> dict:
+        d = asdict(self)
+        d["commence_time"] = self.commence_time.isoformat()
+        d["found_at"] = self.found_at.isoformat()
+        return d
+
+
+def within_date_bounds(commence_time: datetime, cfg) -> bool:
+    """Does this event's US/Eastern calendar date fall inside
+    cfg.detect.date_from/date_to? Both are inclusive "YYYY-MM-DD" strings, or
+    None for no bound on that side -- the default, and the common case, so
+    this is a no-op unless the sidebar's date filter set one.
+    """
+    d = cfg.detect
+    date_from, date_to = getattr(d, "date_from", None), getattr(d, "date_to", None)
+    if not (date_from or date_to):
+        return True
+    et_date = commence_time.astimezone(ET).date().isoformat()
+    if date_from and et_date < date_from:
+        return False
+    if date_to and et_date > date_to:
+        return False
+    return True
+
+
+def in_window(event: EventMeta, cfg, now: datetime) -> bool:
+    """Is this event close enough to bet, and not already under way?"""
+    d = cfg.detect
+    mins = event.minutes_to_start(now)
+    if mins < 0:
+        # min_minutes_to_start is positive by default, so mins < 0 was ALWAYS
+        # also mins < min_minutes_to_start -- the check below excluded every
+        # live event on its own, regardless of skip_live. That made skip_live
+        # dead code: setting it False never actually surfaced a live event.
+        # Branching here instead of falling through is the fix.
+        if d.skip_live:
+            return False
+    elif mins < d.min_minutes_to_start:
+        return False
+    elif d.max_hours_to_start and mins > d.max_hours_to_start * 60.0:
+        return False
+    return within_date_bounds(event.commence_time, cfg)
+
+
+def _fingerprint(*parts) -> str:
+    raw = "|".join("" if p is None else str(p) for p in parts)
+    return hashlib.sha1(raw.encode()).hexdigest()[:16]
+
+
+def _leg_point(q: Quote, group: MarketGroup) -> float | None:
+    """The line to SHOW for this leg: the one its own book posts.
+
+    Spreads are stored folded onto the home axis, so both sides of a group
+    carry the same negative number. Displayed raw that reads as both teams
+    laying points -- a reported arbitrage showed "FanDuel away -30.5" beside
+    "Fanatics home -30.5" when the FanDuel bet is Long Island **+30.5**, which
+    is the number you would type into the book. The away side is the negation.
+    """
+    point = group.key.point
+    if point is None:
+        return q.point
+    if is_spread_market(group.key.market) and q.side == "away":
+        return -point
+    if is_spread_market(group.key.market) and q.side == "home":
+        return point
+    return q.point if q.point is not None else point
+
+
+def stale_alt_ladders(board: Board, max_drift: float, max_vig: float = 1.06
+                      ) -> dict[tuple[str, str, str, float], tuple[float, bool]]:
+    """(event_id, market, book, point) -> (that book's own current main
+    point, whether the book's OWN data confirms it), for every alternate
+    rung that should not be trusted.
+
+    Two independent ways a rung earns that:
+
+    CONFIRMED -- DraftKings tags exactly one selection per alternate ladder
+    "main": true, the rung its own app currently treats as equal to the main
+    line (ladder_main_points). When that disagrees with main_points (read
+    from a DIFFERENT endpoint, the base Game market) by more than max_drift,
+    DraftKings' own data is contradicting itself -- not a threshold guessing
+    something looks off, an actual inconsistency. Every non-main rung in
+    that ladder is flagged, regardless of its own vig: once the ladder's
+    center is known to be wrong, a rung that happens to look properly
+    juiced from that wrong center is not evidence of anything.
+
+    INFERRED -- for a book with no such tag, ask the ladder where IT thinks
+    the true number is. `oddsmath.pickem_crossing` reads the point at which
+    the book's own devigged prices cross 50/50; a ladder built around a
+    number the book has since moved past still centers on that old number,
+    which is the whole defect stated directly. More than max_drift from the
+    book's own recorded main line and the entire ladder is flagged.
+
+    WHY NOT VIG. This check used to compare each far rung's own overround
+    against a fixed bar (`max_vig`, default 1.06), on the reasoning that a
+    genuine tail rung must be priced worse the further out it sits. That
+    reasoning does not survive contact with a second book. Measured on a
+    live NFL board, 2026-09-07:
+
+        book          far rungs   median vig   fraction <= 1.06
+        fanduel             722       1.0591              69.9%
+        draftkings         1263       1.0700               0.0%
+
+    FanDuel holds a flat ~5.9% overround across its whole ladder and moves
+    the PRICE; DraftKings widens to ~7.0%. So a fixed bar at 1.06 separates
+    the two BOOKS, not fresh rungs from stale ones -- it flagged 505 sound
+    FanDuel rungs and could not flag a DraftKings rung at all, which is the
+    exact inversion of what it was written to do (505 flags hid 32 of 99
+    opportunities behind the app's off-by-default "show stale alt lines").
+    Cross-checked against DraftKings' price at the SAME rung, those 505
+    agreed to a median 2.2pp of devigged probability -- ordinary cross-book
+    shading, nothing like a ladder centered ten points away.
+
+    The center test has no such book dependence, because it is measured in
+    POINTS rather than in vig: on that same board every DraftKings and
+    FanDuel ladder centered within 1.45 of its own main line (medians 0.24
+    and 0.30), while the DraftKings NCAAF ladder this check was written for
+    centers on 54.5 against a recorded main of 62.5.
+
+    `max_vig` survives as a FALLBACK, and only where the center cannot be
+    measured at all -- a ladder too flat or too short to cross 50/50, where
+    there is no center to compare. It is applied RELATIVE to the book's own
+    main-line overround rather than as an absolute bar, for the reason the
+    table above gives: a rung priced no worse than that book's own main line
+    despite sitting far from it is the anomaly, and "no worse than its own
+    main" means the same thing at either book.
+
+    Only books with a recorded main_points entry (DraftKings, FanDuel) can
+    be inferred-checked at all; only DraftKings currently has the "main" tag
+    for the confirmed path. Fanatics has neither -- its feed carries its own
+    separate battery of ladder checks instead (see books.ingest_oddschecker).
+    """
+    # (event, market, book) -> point -> side -> quote
+    by_ladder: dict[tuple[str, str, str], dict[float, dict[str, Quote]]] = {}
+    for key, group in board.groups.items():
+        if key.market not in ("totals", "spreads") or key.point is None:
+            continue
+        for side, per_book in group.quotes.items():
+            for book, q in per_book.items():
+                by_ladder.setdefault((key.event_id, key.market, book), {}) \
+                    .setdefault(key.point, {})[side] = q
+
+    stale: dict[tuple[str, str, str, float], tuple[float, bool]] = {}
+    for (event_id, market, book), points in by_ladder.items():
+        main = board.main_points.get((event_id, market, book))
+        if main is None:
+            continue                                  # book never resolved as main-line
+        ladder_main = board.ladder_main_points.get((event_id, market, book))
+        confirmed = ladder_main is not None and abs(ladder_main - main) > max_drift
+
+        # The book's own read of the true number, from its own prices. Either
+        # side works -- the other is 1 - p and crosses the same place -- so
+        # whichever of the two this market names is taken.
+        curve: dict[float, float] = {}
+        vigs: dict[float, float] = {}
+        for point, sides in points.items():
+            a = sides.get("over") or sides.get("home")
+            b = sides.get("under") or sides.get("away")
+            if a is None or b is None or a.decimal <= 1.0 or b.decimal <= 1.0:
+                continue
+            total = 1.0 / a.decimal + 1.0 / b.decimal
+            curve[point] = (1.0 / a.decimal) / total
+            vigs[point] = total
+        center = om.pickem_crossing(curve)
+        off_center = center is not None and abs(center - main) > max_drift
+        main_vig = vigs.get(main)
+
+        for point in points:
+            if abs(point - main) <= max_drift:
+                continue                              # close to main: unremarkable either way
+            if confirmed:
+                stale[(event_id, market, book, point)] = (main, True)
+            elif center is not None:
+                # The center is the measurement; when it agrees with main the
+                # ladder is sound and no per-rung second opinion is wanted --
+                # that second opinion is what produced the 505 false flags.
+                if off_center:
+                    stale[(event_id, market, book, point)] = (main, False)
+            elif main_vig is not None and point in vigs:
+                # No center to measure: fall back to the rung's overround
+                # against this book's OWN main-line overround.
+                if vigs[point] <= main_vig + STALE_VIG_MARGIN:
+                    stale[(event_id, market, book, point)] = (main, False)
+            elif point in vigs and vigs[point] <= max_vig:
+                # Neither a center nor a priced main rung to compare against:
+                # the original absolute bar, kept only for this last case.
+                stale[(event_id, market, book, point)] = (main, False)
+    return stale
+
+
+def push_value(market: str, point: float | None, sides: set[str]) -> float | None:
+    """The result that PUSHES both legs of this group, or None if none can.
+
+    A bet on a whole number returns the stake when the game lands exactly on
+    it. Both sides of one group share the number, so at an integer line they
+    push TOGETHER: every stake comes back and the position returns nothing --
+    not a loss, but not the profit an arbitrage is reported as guaranteeing
+    either.
+
+    Only over/under and home/away groups settle against a number this way
+    (a three-way field or a named outright has no line to land on), and only
+    an integer one can be landed on exactly.
+
+    Spreads live on the home-margin axis with the sign flipped -- the same
+    negation `find_middles` applies to report its window -- so a group point
+    of -3.0 pushes on a home margin of +3.
+
+    This is overwhelmingly a football problem, and it arrived with Fanatics:
+    DraftKings and FanDuel hang their alternate ladders on half-points, while
+    the Oddschecker feed Fanatics runs on carries whole numbers too. The
+    numbers it puts in play -- 3, 7, 10, 14 on a spread, and every integer
+    total -- are precisely the ones NFL games land on most.
+
+    Takes primitives rather than a MarketGroup so `price_candidates` -- which
+    re-prices a SNAPSHOT and has only the stored market/point/sides -- gets
+    the same answer as the live scanner instead of a second reading of the
+    rule that can drift from it.
+    """
+    if point is None or not float(point).is_integer():
+        return None
+    if sides not in ({"over", "under"}, {"home", "away"}):
+        return None
+    return -float(point) if is_spread_market(market) else float(point)
+
+
+def _leg(q: Quote, group: MarketGroup, commission: float, now: datetime,
+        stale_mains: dict[tuple[str, str, str, float], tuple[float, bool]] | None = None
+        ) -> Leg:
+    eff = om.net_of_commission(q.decimal, commission)
+    main_line, confirmed = None, False
+    if stale_mains is not None and group.key.point is not None:
+        # Looked up on the RAW group point -- the home axis -- because that is
+        # the key stale_alt_ladders wrote. Only AFTER the lookup succeeds is
+        # the answer moved onto the axis this leg displays its own point on,
+        # so the warning compares two numbers of the same sign. Reading it
+        # back through `point` instead would look the wrong sign up entirely.
+        hit = stale_mains.get((group.key.event_id, group.key.market, q.book, group.key.point))
+        if hit is not None:
+            main_line, confirmed = hit
+            if is_spread_market(group.key.market) and q.side == "away":
+                main_line = -main_line
+    return Leg(
+        book=q.book,
+        side=q.side,
+        raw_decimal=round(eff, 4),
+        label=side_label(q.side, group.event.home_team, group.event.away_team, group.key.subject),
+        decimal=round(eff, 4),
+        american=om.format_american(eff),
+        point=_leg_point(q, group),
+        link=q.link,
+        limit=q.limit,
+        age_seconds=round(q.age_seconds(now), 1),
+        off_main_line=main_line is not None,
+        main_line=main_line,
+        stale_confirmed=confirmed,
+    )
+
+
+def _stale_line_warning(leg: Leg) -> str:
+    if leg.stale_confirmed:
+        return (f"{leg.book}'s {leg.point:g} is stale -- DraftKings' own alternate-line feed "
+                f"still centers this ladder there, but its main line has moved to "
+                f"{leg.main_line:g}")
+    return (f"{leg.book}'s {leg.point:g} looks stale -- its alternate ladder implies a "
+           f"different number than its own current main line ({leg.main_line:g})")
+
+
+def _describe(group: MarketGroup) -> str:
+    k = group.key
+    bits = [k.market]
+    if k.subject:
+        bits.append(k.subject)
+    if k.point is not None:
+        bits.append(f"{k.point:+g}" if is_spread_market(k.market) else f"{k.point:g}")
+    return " ".join(bits)
+
+
+# --------------------------------------------------------------------------
+# arbitrage
+# --------------------------------------------------------------------------
+def _boost_variants(leg_specs: list[tuple[str, str | None, float]], boosts: list[Boost],
+                    sport_key: str, market: str, event_start: datetime | None = None,
+                    event_id: str | None = None):
+    """(assignment, prices) for the plain market, each singly-boosted leg, and
+    (if more than one leg qualifies) every leg boosted at once.
+
+    leg_specs is (book, side, decimal) per leg, in leg order. assignment is
+    {leg index: Boost}, empty for the unboosted variant, which is always
+    first so a market that arbs on its own still reports without spending a
+    token on it.
+
+    Two DIFFERENT boosts can apply simultaneously here even though a single
+    Boost only ever covers one leg ("one token, one slip") -- each is its own
+    token on its own book's own bet slip, so a DraftKings token on the
+    DraftKings leg and a FanDuel token on the FanDuel leg are two separate
+    placements, not one token doing double duty. Boosting an additional leg
+    only raises that leg's price, which can only lower arb_sum further, so
+    the fully-stacked variant is never worse than any single one -- it is
+    computed directly rather than searched combinatorially. Two boosts both
+    eligible for the SAME leg is not a real scenario (each book normally
+    offers you one live token at a time) but is resolved by keeping the one
+    worth more on that leg, since only one token can go on one slip.
+
+    ONE TOKEN CANNOT COVER TWO LEGS, even when its own terms (book, market,
+    side) allow either one individually -- a same-book two-sided market with
+    no other book on the far side (batter unders exist on DraftKings only,
+    not FanDuel) let an unrestricted "DraftKings batter props" boost qualify
+    for BOTH the Over and the Under, and the stacked variant applied it to
+    both, reporting a "both sides +money" arbitrage that needs the same
+    single-use token redeemed on two different bet slips at once. `used`
+    tracks boosts by identity as they are claimed leg by leg, in order, so a
+    boost already spent on an earlier leg is not offered again to a later
+    one -- the single-leg variant for that later leg is still yielded on its
+    own above, just never combined with a leg already spoken for.
+    """
+    base = [d for _, _, d in leg_specs]
+    yield {}, base
+
+    per_leg: dict[int, Boost] = {}
+    used: set[int] = set()
+    for i, (book, side, decimal) in enumerate(leg_specs):
+        applicable = [b for b in boosts
+                     if b.applies_to(book, sport_key, market, side=side,
+                                     decimal=decimal, event_start=event_start,
+                                     event_id=event_id)]
+        if not applicable:
+            continue
+        best_b = max(applicable, key=lambda b: b.pct)
+        priced = list(base)
+        # the price the BOOK writes, not the exact product: a boosted bet
+        # is booked at whole American odds and settles there
+        priced[i] = om.at_book_price(om.boosted(base[i], best_b.pct))
+        yield {i: best_b}, priced
+        if id(best_b) not in used:
+            per_leg[i] = best_b
+            used.add(id(best_b))
+
+    if len(per_leg) > 1:
+        priced = list(base)
+        for i, b in per_leg.items():
+            priced[i] = om.at_book_price(om.boosted(base[i], b.pct))
+        yield dict(per_leg), priced
+
+
+def _token_shares_account(books: list[str], assignment: dict[int, Boost]) -> bool:
+    """Does a boosted leg's book also carry another leg of this market?
+
+    The same refusal as a same-book pair, for a market with more than two
+    legs. A soccer moneyline has three, so "DraftKings Home boosted, DraftKings
+    Away, FanDuel Draw" spans two books and clears min_books -- but the token
+    still sits on one account beside a bet on the other side of its own market,
+    which is what gets a boosted leg voided and leaves the hedge naked. On a
+    two-leg market with two books this can never be true.
+    """
+    return any(books.count(books[i]) > 1 for i in assignment)
+
+
+def _leg_books(best: dict[str, str], prices: dict[str, dict[str, float]],
+               boosts: list[Boost], sport_key: str, market: str,
+               event_start: datetime | None = None,
+               event_id: str | None = None) -> list[dict[str, str]]:
+    """Which book to take each side at: {side: book}, best-priced first.
+
+    The best price on every side is where an unboosted arbitrage lives, but a
+    token only pays on its OWN book -- and on a market three books price, the
+    book holding the token is usually not the best on any side. A DraftKings
+    token on a soccer moneyline where FanDuel has the best Home, Fanatics the
+    best Draw and FanDuel again the best Away was simply never tried.
+
+    So for each token, and each side it can be spent on, one more set: that
+    side at the token's book, every other side at the best price anywhere
+    ELSE. Excluding the token's book from the hedge is `_token_shares_account`
+    applied up front. A side no other book prices yields no set at all.
+    """
+    sets = [dict(best)]
+    for b in boosts:
+        for side, per_book in prices.items():
+            raw = per_book.get(b.book)
+            if raw is None or not b.applies_to(b.book, sport_key, market, side=side,
+                                               decimal=raw, event_start=event_start,
+                                               event_id=event_id):
+                continue
+            pick = {side: b.book}
+            for other in best:
+                if other == side:
+                    continue
+                rest = {bk: d for bk, d in (prices.get(other) or {}).items() if bk != b.book}
+                if not rest:
+                    break
+                pick[other] = max(rest, key=rest.get)
+            else:
+                if pick not in sets:
+                    sets.append(pick)
+    return sets
+
+
+def find_arbitrages(board: Board, cfg, now: datetime | None = None) -> list[Opportunity]:
+    now = now or utcnow()
+    d = cfg.detect
+    books = set(cfg.books.bettable)
+    boosts = getattr(cfg, "boosts", None) or []
+    stale_mains = stale_alt_ladders(board, d.alt_line_max_drift, d.alt_line_max_vig)
+    out: list[Opportunity] = []
+
+    for group in board.groups.values():
+        if not in_window(group.event, cfg, now):
+            continue
+        sides = group.expected_sides()
+        if not (2 <= len(sides) <= d.max_legs):
+            continue
+
+        ordered = sorted(sides)
+        top = {s: group.best(s, books) for s in ordered}
+        if any(q is None for q in top.values()):
+            continue                                   # incomplete market: not tradeable
+        ev = group.event
+        prices = {s: {bk: q.decimal for bk, q in group.quotes.get(s, {}).items() if bk in books}
+                  for s in ordered}
+
+        best = None
+        for pick in _leg_books({s: q.book for s, q in top.items()}, prices, boosts,
+                               ev.sport_key, group.key.market,
+                               event_start=ev.commence_time, event_id=ev.event_id):
+            quotes = [group.quotes[s][pick[s]] for s in ordered]
+            if len({q.book for q in quotes}) < d.min_books:
+                continue                               # all legs at one book: data artifact
+
+            ages = [q.age_seconds(now) for q in quotes]
+            if max(ages) > d.max_quote_age_seconds:
+                continue
+
+            legs = [_leg(q, group, cfg.books.commission.get(q.book, 0.0), now, stale_mains)
+                    for q in quotes]
+
+            # Each boost applies to ONE slip (its own book's leg), but two
+            # DIFFERENT boosts on two different legs are two separate slips, so
+            # both can be worth placing at once. _boost_variants tries every
+            # single leg alone and, when more than one qualifies, the fully
+            # stacked combination too; the best worst_profit_pct wins.
+            leg_specs = [(l.book, l.side, l.decimal) for l in legs]
+            for assignment, priced in _boost_variants(
+                    leg_specs, boosts, ev.sport_key, group.key.market,
+                    event_start=ev.commence_time, event_id=ev.event_id):
+                if _token_shares_account([l.book for l in legs], assignment):
+                    continue
+                s = om.arb_sum(priced)
+                if s >= 1.0:
+                    continue
+                profit_pct = (1.0 / s - 1.0) * 100.0
+                if profit_pct < d.min_profit_pct:
+                    continue
+                caps = [cfg.books.max_stake.get(l.book) for l in legs]
+                for i, b in assignment.items():
+                    # the token's max stake bounds the whole position, not just its
+                    # own leg -- allocate() shrinks the total to keep the ratio
+                    caps[i] = min(c for c in (caps[i], b.max_stake) if c)
+                alloc = om.allocate(priced, bankroll=cfg.bankroll.total,
+                                    round_to=cfg.bankroll.round_to, max_stakes=caps)
+                if best is None or alloc.worst_profit_pct > best[0].worst_profit_pct:
+                    best = (alloc, assignment, priced, profit_pct, legs, ages)
+        if best is None:
+            continue
+        alloc, assignment, priced, profit_pct, legs, ages = best
+
+        for i, (leg, stake, payout) in enumerate(zip(legs, alloc.stakes, alloc.payouts)):
+            leg.stake, leg.payout = stake, payout
+            leg.decimal = round(priced[i], 4)
+            leg.american = om.format_american(priced[i])
+            if i in assignment:
+                leg.boost_pct = assignment[i].pct
+
+        warnings = []
+        if profit_pct > d.max_profit_pct and not assignment:
+            warnings.append(
+                f"{profit_pct:.1f}% exceeds max_profit_pct ({d.max_profit_pct}%) -- "
+                "usually a stale or mispublished line, verify both prices before staking"
+            )
+        if assignment:
+            tokens = " and ".join(f"the {b.describe()} applied to the {legs[i].book} leg"
+                                  for i, b in sorted(assignment.items()))
+            unboosted_pct = (1.0 / om.arb_sum([l.raw_decimal for l in legs]) - 1.0) * 100.0
+            warnings.append(
+                f"needs {tokens} -- without "
+                f"{'them' if len(assignment) > 1 else 'it'} this is {unboosted_pct:+.2f}%")
+        if alloc.capped:
+            warnings.append(
+                "stake reduced to respect the boost's max stake" if assignment
+                else "stake reduced to respect a per-book limit")
+        if alloc.worst_profit_pct <= 0:
+            warnings.append("rounding erases the edge at this bankroll")
+        if max(ages) > d.max_quote_age_seconds / 2:
+            warnings.append(f"oldest quote is {max(ages):.0f}s old")
+        stale_leg = next((l for l in legs if l.off_main_line), None)
+        if stale_leg is not None:
+            warnings.append(_stale_line_warning(stale_leg))
+        pushes_on = push_value(group.key.market, group.key.point, set(ordered))
+        if pushes_on is not None:
+            warnings.append(
+                f"whole-number line: a result of exactly {pushes_on:g} pushes BOTH legs and "
+                f"returns every stake, so this locks {alloc.worst_profit_pct:.2f}% on every "
+                "other result and 0% on that one")
+
+        boost_desc = " + ".join(b.describe() for _, b in sorted(assignment.items())) or None
+        out.append(Opportunity(
+            kind="arb",
+            fingerprint=_fingerprint("arb", ev.event_id, group.key.market, group.key.subject,
+                                     group.key.point, *[f"{l.book}:{l.side}" for l in legs],
+                                     boost_desc or ""),
+            sport_key=ev.sport_key, sport_title=ev.sport_title, event_id=ev.event_id,
+            matchup=ev.matchup, commence_time=ev.commence_time,
+            market=group.key.market, subject=group.key.subject, description=_describe(group),
+            legs=legs, profit_pct=round(alloc.worst_profit_pct, 3),
+            # An arbitrage's guaranteed return IS its expected return.
+            expected_pct=round(alloc.worst_profit_pct, 3),
+            # ...except on a whole-number line, where the one result that
+            # lands exactly on it hands every stake back. The floor is what
+            # the position guarantees, so there it is zero -- profit_pct
+            # above stays the return on every OTHER result, which is what
+            # the number means and what gets staked against.
+            floor_pct=(0.0 if pushes_on is not None
+                       else round(alloc.worst_profit_pct, 3)),
+            ceiling_pct=round(alloc.best_profit_pct, 3),
+            # Still zero: a push returns the stake, so there is no losing
+            # outcome to carry a probability. The push shows up as a floor
+            # of 0 and a warning, not as risk of loss.
+            risk_pct=0.0,
+            pushes=pushes_on is not None,
+            push_values=([int(pushes_on)] if pushes_on is not None else []),
+            stake_total=alloc.total, profit_abs=alloc.worst_profit,
+            boost=boost_desc,
+            max_age_seconds=round(max(ages), 1), warnings=warnings,
+            stale_alt_line=stale_leg is not None,
+        ))
+
+    out.sort(key=lambda o: o.profit_pct, reverse=True)
+    return out
+
+
+# --------------------------------------------------------------------------
+# middles -- both legs can win; costs a small fixed amount when they don't
+# --------------------------------------------------------------------------
+def middle_scenarios(d_lo: float, d_hi: float, lo_line: float, hi_line: float,
+                     s_lo: float, s_hi: float) -> dict[int, float]:
+    """Profit for every integer result, treating pushes as pushes.
+
+    The low leg is Over `lo_line`: it wins above, pushes exactly on it, loses
+    below. The high leg is Under `hi_line`: wins below, pushes on it, loses
+    above. When a line is a whole number the "middle" outcome returns one
+    stake rather than paying it -- roughly halving the gain, which the
+    both-legs-win formula silently overstated.
+    """
+    total = s_lo + s_hi
+    out: dict[int, float] = {}
+    lo_i, hi_i = int(math.floor(lo_line)) - 1, int(math.ceil(hi_line)) + 1
+    for x in range(lo_i, hi_i + 1):
+        pay = 0.0
+        pay += s_lo * (d_lo if x > lo_line else (1.0 if x == lo_line else 0.0))
+        pay += s_hi * (d_hi if x < hi_line else (1.0 if x == hi_line else 0.0))
+        out[x] = pay - total
+    return out
+
+
+def middle_results(lo_line: float, hi_line: float) -> list[int]:
+    """The whole-number results that fall strictly between two lines.
+
+    Games settle on whole numbers -- points, runs, goals, rebounds -- so only
+    integers can decide a bet, and a window has to contain one to be a middle.
+    Over 53.5 against Under 54 is a real interval and the both-legs-win
+    arithmetic over the reals is sound, but no game finishes on 53.7: there is
+    nothing in that window to win. Over 53 against Under 54 is the same trap
+    with whole lines, where both ends push instead.
+
+    floor/ceil rather than int(): truncation rounds toward zero, which walks
+    the wrong way on the negative half of the spread axis.
+    """
+    return [n for n in range(math.floor(lo_line) + 1, math.ceil(hi_line))
+            if lo_line < n < hi_line]
+
+
+def gap_results(lo_line: float, hi_line: float) -> list[int]:
+    """The whole-number results that fall strictly inside a CROSSED pair.
+
+    `middle_scenarios`'s "low leg wins above `lo_line`, high leg wins below
+    `hi_line`" reading holds even when the lines have crossed (`lo_line >
+    hi_line`) -- outside the gap exactly one leg still wins, same as always,
+    but for `hi_line < n < lo_line` NEITHER threshold is met and both lose.
+    Same floor/ceil-not-int() reasoning as `middle_results`: only a whole
+    number can settle a bet, and truncation walks the wrong way on the
+    negative half of the spread axis.
+    """
+    return [n for n in range(math.floor(hi_line) + 1, math.ceil(lo_line))
+            if hi_line < n < lo_line]
+
+
+def _middle_families(board: Board) -> dict[tuple, list[MarketGroup]]:
+    """Group every priced line of the same market onto one axis, so a low leg
+    at one number can be paired against a high leg at another."""
+    fams: dict[tuple, list[MarketGroup]] = {}
+    for g in board.groups.values():
+        if g.key.point is None:
+            continue
+        sides = g.expected_sides()
+        if not (sides & {"over", "under"} or sides & {"home", "away"}):
+            continue
+        fams.setdefault((g.key.event_id, g.key.market, g.key.subject), []).append(g)
+    return {k: v for k, v in fams.items() if len(v) > 1}
+
+
+def ladder_cdfs(board: Board, books: set[str],
+                min_rungs: int = 3) -> dict[tuple, dict[float, float]]:
+    """(event, market) -> {line: devigged P(over / home covers)}.
+
+    Pooled across books -- best price per side per line, then devigged. One
+    book often posts only its main line on a given game; between the three of
+    them the axis gets covered. Markets with fewer than `min_rungs` two-sided
+    lines are omitted, because two points cannot describe a distribution.
+    """
+    pooled: dict[tuple, dict[float, dict[str, float]]] = {}
+    for g in board.groups.values():
+        if g.key.subject is not None or g.key.point is None:
+            continue
+        rungs = pooled.setdefault((g.key.event_id, g.key.market), {})
+        sides = rungs.setdefault(g.key.point, {})
+        for side, bybook in g.quotes.items():
+            for bk, q in bybook.items():
+                if bk in books and q.decimal > sides.get(side, 0.0):
+                    sides[side] = q.decimal
+    out: dict[tuple, dict[float, float]] = {}
+    for key, rungs in pooled.items():
+        cdf = {}
+        for point, sides in rungs.items():
+            a = sides.get("over") or sides.get("home")
+            b = sides.get("under") or sides.get("away")
+            if not a or not b:
+                continue
+            cdf[point] = (1.0 / a) / (1.0 / a + 1.0 / b)
+        if len(cdf) >= min_rungs:
+            out[key] = cdf
+    return out
+
+
+def p_above(cdf: dict[float, float], value: float, spread: bool) -> float | None:
+    """P(the settled number exceeds `value`), interpolated between rungs.
+
+    Totals sit on the axis directly; a spread's group point is the home line,
+    and home covers when the margin exceeds its negation.
+    """
+    points = sorted(((-p if spread else p), v) for p, v in cdf.items())
+    for x, v in points:
+        if abs(x - value) < 1e-9:
+            return v
+    below = [(x, v) for x, v in points if x < value]
+    above = [(x, v) for x, v in points if x > value]
+    if not below or not above:
+        return None
+    (x0, v0), (x1, v1) = below[-1], above[0]
+    return v0 + (v1 - v0) * (value - x0) / (x1 - x0)
+
+
+def _price_middle_variants(lo_book: str, lo_side: str, d_lo0: float,
+                           hi_book: str, hi_side: str, d_hi0: float,
+                           lo_line: float, hi_line: float, landing: list[int],
+                           boosts: list[Boost], bankroll: float, round_to: float,
+                           sport_key: str, market: str,
+                           event_start: datetime | None = None,
+                           event_id: str | None = None) -> tuple[dict, dict]:
+    """The winning boost variant for one middle pairing, plus the unboosted
+    reading for comparison. Shared by `find_middles` (live) and
+    `price_middle_candidates` (re-pricing a snapshot) so the two cannot drift
+    apart from each other -- the same reason `_boost_variants` itself is
+    shared by the two arbitrage pricers.
+
+    Boosting a leg raises its own price, which helps that leg's own win
+    scenarios -- but the two legs' PROPORTIONAL stake split also shifts when
+    a decimal changes (`allocate` sizes inversely to price), so the net
+    effect on the worst case is not obvious by inspection. Rather than
+    assume, every variant `_boost_variants` offers (plain, each leg boosted
+    alone, and -- if two different tokens each cover a different leg -- both
+    at once) is actually priced, and the one with the best floor wins (ties
+    broken by ceiling).
+
+    Returns (best, plain), each a dict with assignment/d_lo/d_hi/wins/
+    hit_pct/cost_pct/floor_pct/staked.
+    """
+    leg_specs = [(lo_book, lo_side, d_lo0), (hi_book, hi_side, d_hi0)]
+    best = None
+    plain = None
+    for assignment, (d_lo, d_hi) in _boost_variants(leg_specs, boosts, sport_key, market,
+                                                    event_start=event_start,
+                                                    event_id=event_id):
+        # Enumerate the real outcomes instead of assuming both legs win: a
+        # whole-number line pushes, returning the stake rather than paying it.
+        alloc0 = om.allocate([d_lo, d_hi], bankroll=bankroll, round_to=round_to)
+        s_lo, s_hi = alloc0.stakes
+        staked = s_lo + s_hi
+        scenarios = middle_scenarios(d_lo, d_hi, lo_line, hi_line, s_lo, s_hi)
+        wins = {x: p for x, p in scenarios.items() if p > 0}
+        worst = min(scenarios.values())
+        # the headline is what a landing pays -- every number inside the
+        # window wins both legs for the same amount
+        hit_pct = min(scenarios[n] for n in landing) / staked * 100.0
+        cost_pct = -worst / staked * 100.0
+        row = {"assignment": assignment, "d_lo": d_lo, "d_hi": d_hi, "wins": wins,
+              "hit_pct": hit_pct, "cost_pct": cost_pct, "floor_pct": -cost_pct,
+              "staked": staked}
+        if not assignment:
+            plain = row
+        if best is None or row["floor_pct"] > best["floor_pct"] or (
+                row["floor_pct"] == best["floor_pct"] and row["hit_pct"] > best["hit_pct"]):
+            best = row
+    return best, plain
+
+
+def find_middles(board: Board, cfg, now: datetime | None = None) -> list[Opportunity]:
+    now = now or utcnow()
+    d = cfg.detect
+    if not d.middles_enabled:
+        return []
+    books = set(cfg.books.bettable)
+    out: list[Opportunity] = []
+    cdfs = ladder_cdfs(board, books)
+    stale_mains = stale_alt_ladders(board, d.alt_line_max_drift, d.alt_line_max_vig)
+
+    for (event_id, market, subject), groups in _middle_families(board).items():
+        if not in_window(groups[0].event, cfg, now):
+            continue
+        spread = is_spread_market(market)
+        lo_side, hi_side = ("home", "away") if spread else ("over", "under")
+        # low leg wants the smaller number, high leg the larger, in the same axis
+        lows = [(g, g.best(lo_side, books)) for g in groups if g.best(lo_side, books)]
+        highs = [(g, g.best(hi_side, books)) for g in groups if g.best(hi_side, books)]
+        if not lows or not highs:
+            continue
+
+        for glo, qlo in lows:
+            for ghi, qhi in highs:
+                plo, phi = glo.key.point, ghi.key.point
+                # spreads live on the home-margin axis with the sign flipped
+                width = (plo - phi) if spread else (phi - plo)
+                if width == 0:
+                    continue          # the lines touch exactly: no window, no gap
+                if qlo.book == qhi.book:
+                    continue
+                ages = [qlo.age_seconds(now), qhi.age_seconds(now)]
+                if max(ages) > d.max_quote_age_seconds:
+                    continue
+
+                legs = [_leg(q, g, cfg.books.commission.get(q.book, 0.0), now, stale_mains)
+                        for q, g in ((qlo, glo), (qhi, ghi))]
+                if any(l.decimal > d.middle_max_leg_decimal for l in legs):
+                    continue          # a longshot price is not a main line
+                stale_leg = next((l for l in legs if l.off_main_line), None)
+                ev = glo.event
+                axis_lo = -plo if spread else plo
+                axis_hi = -phi if spread else phi
+
+                if width < 0:
+                    # A "gap": two books' lines have CROSSED, so outside it
+                    # exactly one leg still wins as always, but inside the
+                    # narrow band neither does -- both stakes are lost. Not a
+                    # guaranteed position like an arbitrage; see gap_results.
+                    if not d.gaps_enabled or -width > d.gap_max_width:
+                        continue
+                    lo_line, hi_line = axis_lo, axis_hi     # crossed: lo_line > hi_line
+                    # A push at a whole-number boundary line is not modeled
+                    # below (the "outside" reading assumes a clean win/loss,
+                    # not a partial push) -- rather than risk an optimistic
+                    # ceiling, skip it. Half-point lines, the ordinary case,
+                    # can never push, so this costs nothing for the common case.
+                    if float(lo_line).is_integer() or float(hi_line).is_integer():
+                        continue
+                    gap_values = gap_results(lo_line, hi_line)
+                    if not gap_values:
+                        continue     # crossed, but no whole number sits in the gap
+
+                    leg_specs = [(legs[0].book, lo_side, legs[0].decimal),
+                                (legs[1].book, hi_side, legs[1].decimal)]
+                    best_gap = None
+                    for assignment, priced in _boost_variants(
+                            leg_specs, getattr(cfg, "boosts", None) or [],
+                            ev.sport_key, market, event_start=ev.commence_time,
+                            event_id=ev.event_id):
+                        caps = [cfg.books.max_stake.get(l.book) for l in legs]
+                        for i, b in assignment.items():
+                            caps[i] = min(c for c in (caps[i], b.max_stake) if c)
+                        alloc = om.allocate(priced, bankroll=cfg.bankroll.total,
+                                           round_to=cfg.bankroll.round_to, max_stakes=caps)
+                        # Landing in the gap loses both legs outright regardless
+                        # of price, so a boost cannot rescue THAT outcome -- it
+                        # only ever helps the ordinary (one-wins) case, so the
+                        # boost is chosen the same way find_arbitrages chooses
+                        # one: maximise worst_profit_pct, the worse of the two
+                        # ordinary outcomes.
+                        if best_gap is None or alloc.worst_profit_pct > best_gap[0].worst_profit_pct:
+                            best_gap = (alloc, assignment, priced)
+                    alloc, assignment, priced = best_gap
+                    if alloc.worst_profit_pct < d.gap_min_profit_pct:
+                        continue
+
+                    for i, (leg, stake, payout) in enumerate(
+                            zip(legs, alloc.stakes, alloc.payouts)):
+                        leg.stake, leg.payout = stake, payout
+                        leg.decimal = round(priced[i], 4)
+                        leg.american = om.format_american(priced[i])
+                        if i in assignment:
+                            leg.boost_pct = assignment[i].pct
+
+                    window = (-plo, -phi) if spread else (plo, phi)
+                    window = (min(window), max(window))
+                    cdf = cdfs.get((event_id, market))
+                    p_gap = None
+                    if cdf and subject is None:
+                        lo_p = p_above(cdf, window[0], spread)
+                        hi_p = p_above(cdf, window[1], spread)
+                        if lo_p is not None and hi_p is not None:
+                            p_gap = max(0.0, min(1.0, abs(lo_p - hi_p)))
+
+                    lands_on = ("/".join(str(n) for n in gap_values) if len(gap_values) <= 4
+                               else f"{gap_values[0]}-{gap_values[-1]}")
+                    gap_warnings = [f"NOT a guaranteed position — both legs lose if the "
+                                   f"result lands on {lands_on}"]
+                    if assignment:
+                        tokens = " and ".join(
+                            f"the {b.describe()} applied to the {legs[i].book} leg"
+                            for i, b in sorted(assignment.items()))
+                        gap_warnings.append(f"needs {tokens} to reach "
+                                           f"{alloc.worst_profit_pct:+.2f}% outside the gap")
+                    if stale_leg is not None:
+                        gap_warnings.append(_stale_line_warning(stale_leg))
+
+                    gap_boost_desc = (" + ".join(b.describe() for _, b in sorted(assignment.items()))
+                                      or None)
+                    out.append(Opportunity(
+                        kind="gap",
+                        fingerprint=_fingerprint("gap", event_id, market, subject, plo, phi,
+                                                 qlo.book, qhi.book),
+                        sport_key=ev.sport_key, sport_title=ev.sport_title, event_id=event_id,
+                        matchup=ev.matchup, commence_time=ev.commence_time,
+                        market=market, subject=subject,
+                        description=f"{market}{' ' + subject if subject else ''} gap "
+                                    f"{window[0]:g}-{window[1]:g} (loses both on {lands_on})",
+                        legs=legs, profit_pct=round(alloc.worst_profit_pct, 3),
+                        fair_prob=(round(p_gap, 4) if p_gap is not None else None),
+                        expected_pct=(round((1.0 - p_gap) * alloc.worst_profit_pct - p_gap * 100.0, 3)
+                                     if p_gap is not None else None),
+                        floor_pct=-100.0,
+                        ceiling_pct=round(alloc.worst_profit_pct, 3),
+                        risk_pct=(round(p_gap * 100.0, 3) if p_gap is not None else None),
+                        max_loss_pct=100.0,
+                        stake_total=alloc.total, profit_abs=alloc.worst_profit,
+                        hit_values=gap_values,
+                        middle_window=window, max_age_seconds=round(max(ages), 1),
+                        boost=gap_boost_desc,
+                        warnings=gap_warnings,
+                        stale_alt_line=stale_leg is not None,
+                    ))
+                    continue
+
+                if width < d.middle_min_width or width > d.middle_max_width:
+                    continue
+                # A positive width is not enough. The bet settles on a whole
+                # number, so the window has to hold one: Over 53.5 / Under 54
+                # spans half a point no score can land on, and Over 53 /
+                # Under 54 pushes at both ends. Neither can win both legs.
+                lo_line, hi_line = axis_lo, axis_hi        # ordered: width > 0
+                landing = middle_results(lo_line, hi_line)
+                if not landing:
+                    log.debug("%s %s: no whole number lies between %g and %g",
+                              market, subject or "game", lo_line, hi_line)
+                    continue
+
+                best_variant, plain_variant = _price_middle_variants(
+                    legs[0].book, lo_side, legs[0].decimal,
+                    legs[1].book, hi_side, legs[1].decimal,
+                    lo_line, hi_line, landing, getattr(cfg, "boosts", None) or [],
+                    cfg.bankroll.total, cfg.bankroll.round_to,
+                    ev.sport_key, market, event_start=ev.commence_time,
+                    event_id=ev.event_id)
+                if best_variant["cost_pct"] > d.middle_max_cost_pct:
+                    continue
+                assignment = best_variant["assignment"]
+                d_lo, d_hi = best_variant["d_lo"], best_variant["d_hi"]
+                wins, hit_pct, cost_pct, staked = (
+                    best_variant["wins"], best_variant["hit_pct"],
+                    best_variant["cost_pct"], best_variant["staked"])
+                plain_metrics = (plain_variant["hit_pct"], plain_variant["cost_pct"])
+                # a whole-number end returns one stake instead of paying it,
+                # so it profits far less; break even on that weaker result
+                min_hit_pct = min(wins.values()) / staked * 100.0
+                breakeven = (cost_pct / (cost_pct + min_hit_pct) * 100.0
+                             if (cost_pct + min_hit_pct) > 0 else 100.0)
+                hit_values = landing
+                push_values = sorted(x for x in wins if float(x) in (lo_line, hi_line))
+
+                legs[0].decimal, legs[1].decimal = round(d_lo, 4), round(d_hi, 4)
+                legs[0].american, legs[1].american = (om.format_american(d_lo),
+                                                       om.format_american(d_hi))
+                for i, b in assignment.items():
+                    legs[i].boost_pct = b.pct
+
+                caps = [cfg.books.max_stake.get(l.book) for l in legs]
+                for i, b in assignment.items():
+                    # the token's max stake bounds the whole position, not just
+                    # its own leg -- allocate() shrinks the total to keep the ratio
+                    caps[i] = min(c for c in (caps[i], b.max_stake) if c)
+                alloc = om.allocate([l.decimal for l in legs], bankroll=cfg.bankroll.total,
+                                    round_to=cfg.bankroll.round_to, max_stakes=caps)
+                for leg, stake, payout in zip(legs, alloc.stakes, alloc.payouts):
+                    leg.stake, leg.payout = stake, payout
+
+                # report the window in the units the result is settled in:
+                # total points for O/U, home margin of victory for spreads
+                window = (-plo, -phi) if spread else (plo, phi)
+                window = (min(window), max(window))
+                # How often the window actually lands, read off the books' own
+                # alternate ladders rather than assumed. Without it the list
+                # ranks on "+131% if it lands" and a middle that hits 1.5% of
+                # the time outranks every real arbitrage. Pushes are ignored,
+                # which understates rather than flatters: a push returns a
+                # stake instead of losing it.
+                cdf = cdfs.get((event_id, market))
+                p_hit = None
+                if cdf and subject is None:
+                    lo_p = p_above(cdf, window[0], spread)
+                    hi_p = p_above(cdf, window[1], spread)
+                    if lo_p is not None and hi_p is not None:
+                        p_hit = max(0.0, min(1.0, abs(lo_p - hi_p)))
+
+                lands_on = ("/".join(str(n) for n in hit_values) if len(hit_values) <= 4
+                            else f"{hit_values[0]}-{hit_values[-1]}")
+                warnings = []
+                if push_values:
+                    warnings.append(
+                        f"{'/'.join(str(x) for x in push_values)} pushes a leg: that result "
+                        "returns one stake instead of paying it, so it earns roughly half")
+                if cost_pct <= 0:
+                    warnings.append("free middle: this is also a straight arbitrage")
+                if assignment:
+                    tokens = " and ".join(f"the {b.describe()} applied to the {legs[i].book} leg"
+                                          for i, b in sorted(assignment.items()))
+                    plain_hit, plain_cost = plain_metrics
+                    warnings.append(
+                        f"needs {tokens} -- without "
+                        f"{'them' if len(assignment) > 1 else 'it'} this middle's floor is "
+                        f"{-plain_cost:+.2f}% and its ceiling {plain_hit:.1f}%")
+                if stale_leg is not None:
+                    warnings.append(_stale_line_warning(stale_leg))
+
+                boost_desc = " + ".join(b.describe() for _, b in sorted(assignment.items())) or None
+                out.append(Opportunity(
+                    kind="middle",
+                    fingerprint=_fingerprint("mid", event_id, market, subject, plo, phi,
+                                             qlo.book, qhi.book),
+                    sport_key=ev.sport_key, sport_title=ev.sport_title, event_id=event_id,
+                    matchup=ev.matchup, commence_time=ev.commence_time,
+                    market=market, subject=subject,
+                    description=f"{market}{' ' + subject if subject else ''} middle "
+                                f"{window[0]:g}-{window[1]:g} (wins both on {lands_on})",
+                    legs=legs, profit_pct=round(hit_pct, 3),
+                    fair_prob=(round(p_hit, 4) if p_hit is not None else None),
+                    expected_pct=(round(p_hit * hit_pct - (1.0 - p_hit) * cost_pct, 3)
+                                  if p_hit is not None else None),
+                    floor_pct=round(-cost_pct, 3),
+                    ceiling_pct=round(hit_pct, 3),
+                    risk_pct=(0.0 if cost_pct <= 0 else
+                             (round((1.0 - p_hit) * 100.0, 3) if p_hit is not None else None)),
+                    free_middle=cost_pct <= 0,
+                    free_middle_floor_pct=(round(-cost_pct, 3) if cost_pct <= 0 else None),
+                    stake_total=alloc.total,
+                    profit_abs=round(alloc.total * hit_pct / 100.0, 2),
+                    max_loss_pct=round(max(cost_pct, 0.0), 3),
+                    breakeven_hit_pct=round(max(breakeven, 0.0), 2),
+                    hit_values=hit_values, push_values=push_values,
+                    pushes=bool(push_values),
+                    middle_window=window, max_age_seconds=round(max(ages), 1),
+                    boost=boost_desc,
+                    warnings=warnings,
+                    stale_alt_line=stale_leg is not None,
+                ))
+
+    # Gaps get their OWN cap: they rank near the bottom of the middle
+    # heuristic below (max_loss_pct is always 100 for one), so mixing them in
+    # before truncating would let a page of real middles crowd every gap out
+    # of the list entirely, defeating the point of surfacing them at all.
+    middles = [o for o in out if o.kind == "middle"]
+    gaps = [o for o in out if o.kind == "gap"]
+
+    # Free middles first, regardless of size -- no downside means one must
+    # not be truncated away by middle_max_results in favour of an ordinary
+    # middle that merely scores higher on the cost/reward heuristic below.
+    middles.sort(key=lambda o: (o.free_middle, o.profit_pct / (o.max_loss_pct + 0.5)),
+                reverse=True)
+    # Smallest chance of landing in the gap first -- that IS the point of a
+    # gap play. Unmeasured must sort last, not first: absence of a CDF is not
+    # evidence of safety.
+    gaps.sort(key=lambda o: o.risk_pct if o.risk_pct is not None else 101.0)
+    return middles[: d.middle_max_results] + gaps[: d.gap_max_results]
+
+
+# --------------------------------------------------------------------------
+# +EV -- price a bettable book against a sharp anchor's devigged number
+# --------------------------------------------------------------------------
+def _fair_probs(group: MarketGroup, anchor_books: list[str], method: str,
+                sides: list[str]) -> tuple[dict[str, float], str] | None:
+    for book in anchor_books:
+        prices = []
+        for s in sides:
+            q = group.quotes.get(s, {}).get(book)
+            if q is None:
+                break
+            prices.append(q.decimal)
+        else:
+            return dict(zip(sides, om.fair_probs_from_decimals(prices, method))), book
+    return None
+
+
+def _consensus_probs(group: MarketGroup, sides: list[str], exclude: str,
+                     method: str, min_books: int) -> dict[str, float] | None:
+    """Fallback anchor: average the field's implied probabilities, minus the
+    book being evaluated, then remove the vig from that average."""
+    contributors = [b for b in group.book_sides
+                    if b != exclude and set(sides) <= group.book_sides[b]]
+    if len(contributors) < min_books:
+        return None
+    avg = []
+    for s in sides:
+        ps = [om.implied_prob(group.quotes[s][b].decimal) for b in contributors]
+        avg.append(sum(ps) / len(ps))
+    return dict(zip(sides, om.devig(avg, method)))
+
+
+def find_ev(board: Board, cfg, now: datetime | None = None) -> list[Opportunity]:
+    now = now or utcnow()
+    d = cfg.detect
+    if not d.ev_enabled:
+        return []
+    books = set(cfg.books.bettable)
+    out: list[Opportunity] = []
+    stale_mains = stale_alt_ladders(board, d.alt_line_max_drift, d.alt_line_max_vig)
+
+    for group in board.groups.values():
+        if not in_window(group.event, cfg, now):
+            continue
+        sides = sorted(group.expected_sides())
+        if not (2 <= len(sides) <= d.max_legs):
+            continue
+
+        anchored = _fair_probs(group, cfg.books.reference, d.ev_method, sides)
+        for side in sides:
+            for book, q in group.quotes.get(side, {}).items():
+                if book not in books:
+                    continue
+                if q.age_seconds(now) > d.max_quote_age_seconds:
+                    continue
+                if anchored:
+                    fair, anchor_name = anchored[0][side], anchored[1]
+                elif d.ev_allow_consensus:
+                    probs = _consensus_probs(group, sides, book, d.ev_method, d.ev_consensus_min_books)
+                    if not probs:
+                        continue
+                    fair, anchor_name = probs[side], "consensus"
+                else:
+                    continue
+
+                eff = om.net_of_commission(q.decimal, cfg.books.commission.get(book, 0.0))
+                edge = om.ev_pct(eff, fair)
+                if edge < d.ev_min_pct or edge > d.ev_max_pct:
+                    continue
+
+                k = om.kelly_fraction(eff, fair) * cfg.detect.kelly_fraction
+                stake = round(min(k * cfg.bankroll.total,
+                                  cfg.books.max_stake.get(book) or float("inf")), 2)
+                leg = _leg(q, group, cfg.books.commission.get(book, 0.0), now, stale_mains)
+                leg.stake = stake
+                leg.payout = round(stake * eff, 2)
+
+                ev_meta = group.event
+                ev_warnings = [] if anchor_name != "consensus" \
+                    else ["priced off book consensus, not a sharp anchor"]
+                if leg.off_main_line:
+                    ev_warnings.append(_stale_line_warning(leg))
+                out.append(Opportunity(
+                    kind="ev",
+                    fingerprint=_fingerprint("ev", ev_meta.event_id, group.key.market,
+                                             group.key.subject, group.key.point, book, side),
+                    sport_key=ev_meta.sport_key, sport_title=ev_meta.sport_title,
+                    event_id=ev_meta.event_id, matchup=ev_meta.matchup,
+                    commence_time=ev_meta.commence_time, market=group.key.market,
+                    subject=group.key.subject, description=_describe(group),
+                    legs=[leg], profit_pct=round(edge, 3), stake_total=stake,
+                    # +EV's headline is already an expected return.
+                    expected_pct=round(edge, 3),
+                    profit_abs=round(stake * edge / 100.0, 2),
+                    fair_prob=round(fair, 5),
+                    kelly_stake=stake, anchor_book=anchor_name,
+                    max_age_seconds=leg.age_seconds,
+                    warnings=ev_warnings,
+                    stale_alt_line=leg.off_main_line,
+                ))
+
+    out.sort(key=lambda o: o.profit_pct, reverse=True)
+    return out[: d.ev_max_results]
+
+
+def both_sides_plus(decimals: list[float]) -> bool:
+    """Is every leg at positive American odds?
+
+    Worth naming because it is the screen you can run by eye. Positive American
+    odds means decimal >= 2.0, so 1/d <= 0.5, and two of those sum to <= 1.0 --
+    an arbitrage by definition, with no arithmetic needed. (+100/+100 is the
+    boundary: it sums to exactly 1.0 and locks nothing, so one leg has to be
+    strictly longer.)
+
+    A boost is what usually puts a leg over that line: 25% turns -110 into
+    +114 and 50% turns it into +136, so if the other book already has the
+    other side at +money the pair is an arbitrage on sight.
+    """
+    return len(decimals) >= 2 and all(float(d) >= 2.0 for d in decimals) \
+        and any(float(d) > 2.0 for d in decimals)
+
+
+def _start_of(cand: dict) -> datetime | None:
+    """A candidate's start time, or None if it cannot be read.
+
+    None means "do not apply the expiry rule" rather than "reject": a snapshot
+    written before commence_time was carried should not silently stop every
+    boost from applying.
+    """
+    try:
+        ts = datetime.fromisoformat(cand.get("commence_time") or "")
+    except (ValueError, TypeError):
+        return None
+    return ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
+
+
+def price_candidates(cands: list[dict], boosts: list[Boost], cfg,
+                     min_profit_pct: float | None = None) -> list[dict]:
+    """Re-price snapshotted candidates under a set of boosts.
+
+    This is what the boost slider drives. It is deliberately the same shape as
+    `find_arbitrages` -- try each leg as the boosted one, keep the better, size
+    the position off the token's max stake -- so the number on the screen is
+    the number the scanner would report, rather than a second implementation
+    that drifts from it.
+
+    Returns rows sorted by profit, each carrying the staking plan.
+    """
+    floor = cfg.detect.min_profit_pct if min_profit_pct is None else min_profit_pct
+    out = []
+    for c in cands:
+        # Both legs at ONE book is not an arbitrage, whatever a boost does to
+        # one of the prices. Every other path already refuses it --
+        # find_arbitrages through min_books, find_middles and
+        # middle_candidates through an explicit `qlo.book == qhi.book` -- and
+        # the boost slider was the one that did not: it read `single_book` as
+        # "price this, but only with a boost".
+        #
+        # The arithmetic was never wrong. A 50% token really does beat one
+        # book's own vig: DraftKings' own Weber -1.5 sets at +105 boosts to
+        # +157 against its own Sach +1.5 at -140 and sums to 0.973. What the
+        # boost cannot do is make the position placeable -- both bets land on
+        # ONE account, on the two sides of one market, one of them on a promo.
+        # That is the textbook trigger for the book voiding the boosted leg
+        # and leaving the hedge naked, and it is the most legible arbitrage
+        # signal there is to a book that already limits accounts for it (see
+        # HANDOFF §6: losing a book costs more than any boost is worth).
+        #
+        # Found on a 50% DraftKings tennis token, where these were not a
+        # curiosity but the bulk of the panel: 19 of 25 boosted rows on one
+        # live slate, all DraftKings-vs-DraftKings, sorted above the six
+        # genuine two-book ones.
+        #
+        # The token is not wasted. price_boosted_ev reads these same
+        # candidates and prices the single boosted leg as +EV, which is what
+        # a boost no second book can cover actually is -- the app's
+        # "Best +EV" mode is where they belong and where they still appear.
+        #
+        # The legs are chosen per token by `_leg_books`, the same helper the
+        # scanner uses: the stored legs are the best price per side, and a
+        # token's own book is often not that.
+        prices = c.get("prices") or {}
+        by_side = {l.get("side"): l for l in c["legs"]}
+        best = None
+        for pick in _leg_books({s: l["book"] for s, l in by_side.items()}, prices, boosts,
+                               c["sport_key"], c["market"], event_start=_start_of(c),
+                               event_id=c.get("event_id")):
+            legs = [l if pick[s] == l["book"] else
+                    {**l, "book": pick[s], "decimal": prices[s][pick[s]]}
+                    for s, l in by_side.items()]
+            if len({l["book"] for l in legs}) < 2:
+                continue
+            leg_specs = [(l["book"], l.get("side"), l["decimal"]) for l in legs]
+            for assignment, priced in _boost_variants(leg_specs, boosts, c["sport_key"],
+                                                      c["market"], event_start=_start_of(c),
+                                                      event_id=c.get("event_id")):
+                if _token_shares_account([l["book"] for l in legs], assignment):
+                    continue
+                s = om.arb_sum(priced)
+                if s >= 1.0:
+                    continue
+                caps = [cfg.books.max_stake.get(l["book"]) for l in legs]
+                for i, b in assignment.items():
+                    caps[i] = min(x for x in (caps[i], b.max_stake) if x)
+                alloc = om.allocate(priced, bankroll=cfg.bankroll.total,
+                                    round_to=cfg.bankroll.round_to, max_stakes=caps)
+                if alloc.worst_profit_pct < floor:
+                    continue
+                if best is None or alloc.worst_profit_pct > best[0].worst_profit_pct:
+                    best = (alloc, assignment, priced, legs)
+        if best is None:
+            continue
+        alloc, assignment, priced, legs = best
+        base = [l["decimal"] for l in legs]
+        boost_desc = " + ".join(b.describe() for _, b in sorted(assignment.items())) or None
+        pushes_on = push_value(c["market"], c.get("point"),
+                               {l.get("side") for l in legs})
+        out.append({
+            **{k: c[k] for k in ("sport_key", "sport_title", "matchup", "market",
+                                 "subject", "point", "commence_time")},
+            "profit_pct": round(alloc.worst_profit_pct, 3),
+            # floor: guaranteed no matter which leg wins. ceiling: what the
+            # better-paying leg actually returns -- these differ only when
+            # rounded stakes stop exactly equalising the two outcomes, which
+            # is small but real, and worth showing rather than assuming away.
+            # ...and zero on a whole-number line, where the result that lands
+            # exactly on it pushes both legs and returns every stake. Read
+            # through the same push_value the scanner uses.
+            "floor_pct": (0.0 if pushes_on is not None
+                          else round(alloc.worst_profit_pct, 3)),
+            "ceiling_pct": round(alloc.best_profit_pct, 3),
+            "pushes": pushes_on is not None,
+            "push_values": [int(pushes_on)] if pushes_on is not None else [],
+            "profit_abs": alloc.worst_profit,
+            "stake_total": alloc.total,
+            "unboosted_pct": round((1.0 / om.arb_sum(base) - 1.0) * 100.0, 3),
+            "boost": boost_desc,
+            "both_plus": both_sides_plus(priced),
+            # both prices: `raw_american` is what the book posts and what you
+            # verify against before placing, `american` is what it pays after
+            # the boost. Showing only the boosted price makes the slip look
+            # wrong at the counter.
+            "legs": [{**legs[i], "stake": alloc.stakes[i],
+                      "payout": alloc.payouts[i],
+                      "priced": round(priced[i], 4),
+                      "raw_american": om.format_american(legs[i]["decimal"]),
+                      "american": om.format_american(priced[i]),
+                      "boost_pct": assignment[i].pct if i in assignment else 0.0}
+                     for i in range(len(legs))],
+        })
+    out.sort(key=lambda r: r["profit_pct"], reverse=True)
+    return out
+
+
+def price_middle_candidates(cands: list[dict], boosts: list[Boost], cfg) -> list[dict]:
+    """Re-price snapshotted middle pairings under a set of boosts.
+
+    The middle-shaped counterpart to `price_candidates`: that one re-prices
+    single two-sided markets (`run.candidates`), this one re-prices two
+    DIFFERENT point lines paired into a middle (`run.middle_candidates`).
+    Both exist so the boost slider can work from a snapshot without
+    re-scanning, and both call `_price_middle_variants`/`_boost_variants`
+    rather than re-deriving the maths, so this cannot drift from what
+    `find_middles` would report live.
+
+    Returns rows sorted with free middles first, then by floor -- the same
+    order `find_middles` ranks free middles in, since a floor guaranteed no
+    matter what outranks a bigger number that depends on the window landing.
+    """
+    out = []
+    for c in cands:
+        legs = c["legs"]
+        lo, hi = legs[0], legs[1]
+        landing = middle_results(lo["line"], hi["line"])
+        if not landing:
+            continue
+        best, plain = _price_middle_variants(
+            lo["book"], lo["side"], lo["decimal"], hi["book"], hi["side"], hi["decimal"],
+            lo["line"], hi["line"], landing, boosts, cfg.bankroll.total, cfg.bankroll.round_to,
+            c["sport_key"], c["market"], event_start=_start_of(c),
+            event_id=c.get("event_id"))
+        if best["cost_pct"] > cfg.detect.middle_max_cost_pct:
+            continue
+        assignment = best["assignment"]
+        d_lo, d_hi = best["d_lo"], best["d_hi"]
+        min_hit_pct = (min(best["wins"].values()) / best["staked"] * 100.0
+                      if best["wins"] else 0.0)
+        breakeven = (best["cost_pct"] / (best["cost_pct"] + min_hit_pct) * 100.0
+                    if (best["cost_pct"] + min_hit_pct) > 0 else 100.0)
+        caps = [cfg.books.max_stake.get(lo["book"]), cfg.books.max_stake.get(hi["book"])]
+        for i, b in assignment.items():
+            # the token's max stake bounds the whole position, not just its
+            # own leg -- allocate() shrinks the total to keep the ratio
+            caps[i] = min(x for x in (caps[i], b.max_stake) if x)
+        alloc = om.allocate([d_lo, d_hi], bankroll=cfg.bankroll.total,
+                            round_to=cfg.bankroll.round_to, max_stakes=caps)
+        priced = [d_lo, d_hi]
+        out.append({
+            **{k: c[k] for k in ("sport_key", "sport_title", "matchup", "market",
+                                 "subject", "commence_time", "window")},
+            "hit_pct": round(best["hit_pct"], 3),
+            "cost_pct": round(best["cost_pct"], 3),
+            "floor_pct": round(best["floor_pct"], 3),
+            "ceiling_pct": round(best["hit_pct"], 3),
+            "free_middle": best["cost_pct"] <= 0,
+            "breakeven_hit_pct": round(max(breakeven, 0.0), 2),
+            "unboosted_floor_pct": round(-plain["cost_pct"], 3),
+            "unboosted_ceiling_pct": round(plain["hit_pct"], 3),
+            "boost": " + ".join(b.describe() for _, b in sorted(assignment.items())) or None,
+            "stake_total": alloc.total,
+            "legs": [{**legs[i], "stake": alloc.stakes[i], "payout": alloc.payouts[i],
+                     "priced": round(priced[i], 4),
+                     "raw_american": om.format_american(legs[i]["decimal"]),
+                     "american": om.format_american(priced[i]),
+                     "boost_pct": assignment[i].pct if i in assignment else 0.0}
+                    for i in range(2)],
+        })
+    out.sort(key=lambda r: (r["free_middle"], r["floor_pct"]), reverse=True)
+    return out
+
+
+def price_boosted_ev(cands: list[dict], boosts: list[Boost], cfg,
+                     min_ev_pct: float = 0.0) -> list[dict]:
+    """Expected value of a boosted bet that cannot be hedged.
+
+    A boost no second book can cover is not wasted -- it stops being an
+    arbitrage and becomes an +EV bet, and the question changes from "is this
+    risk-free" to "which single bet is it worth most on". That is the normal
+    case, not the exception: DraftKings' batter-props token is valid only on
+    over-only Milestones, and FanDuel posts no under on any batter market, so
+    nothing can hedge it.
+
+    Fair probability comes from devigging the best price on every side -- the
+    over/under pair, or a soccer moneyline's Home/Draw/Away. Across books that
+    is a better estimate than either book alone, since each side is the
+    sharpest price available. Where the boosted book's own price on that
+    side is shorter than the devigged fair, the shorter one wins: the estimate
+    should never be more generous than what a book is willing to lay.
+    """
+    out = []
+    method = getattr(cfg.detect, "ev_method", "power")
+    for c in cands:
+        prices = c.get("prices") or {}
+        legs = c["legs"]
+        if len(legs) not in (2, 3):
+            continue
+        # Per-SIDE, not `c["point"]` -- that is the group's home-axis-folded
+        # point, and a spread's away side needs it negated. Falls back to the
+        # folded point for a snapshot written before legs carried their own.
+        point_by_side = {l["side"]: l.get("point") for l in legs}
+        try:
+            fair_by_side = dict(zip(
+                [l["side"] for l in legs],
+                om.fair_probs_from_decimals([l["decimal"] for l in legs], method)))
+        except (ValueError, ZeroDivisionError):
+            continue
+        for b in boosts:
+            for side, per_book in prices.items():
+                raw = per_book.get(b.book)
+                if raw is None:
+                    continue
+                if not b.applies_to(b.book, c["sport_key"], c["market"],
+                                    side=side, decimal=raw,
+                                    event_start=_start_of(c),
+                                    event_id=c.get("event_id")):
+                    continue
+                fair = fair_by_side.get(side)
+                if not fair:
+                    continue
+                # never assume a longer price than the market's own read
+                fair = min(fair, om.implied_prob(raw))
+                boosted = om.at_book_price(om.boosted(raw, b.pct))
+                ev = om.ev_pct(boosted, fair)
+                if ev < min_ev_pct:
+                    continue
+                stake = min(b.max_stake, cfg.bankroll.total)
+                out.append({
+                    **{k: c[k] for k in ("sport_key", "sport_title", "matchup",
+                                         "market", "subject", "commence_time")},
+                    "point": point_by_side.get(side, c.get("point")),
+                    "book": b.book, "side": side,
+                    "raw_decimal": raw,
+                    "raw_american": om.format_american(raw),
+                    "boosted_decimal": round(boosted, 4),
+                    "american": om.format_american(boosted),
+                    "boost": b.describe(), "boost_pct": b.pct,
+                    "fair_prob": round(fair, 5),
+                    "ev_pct": round(ev, 3),
+                    "stake": round(stake, 2),
+                    "ev_abs": round(stake * ev / 100.0, 2),
+                    "other_books": {bk: v for bk, v in per_book.items() if bk != b.book},
+                })
+    out.sort(key=lambda r: r["ev_pct"], reverse=True)
+    return out
+
+
+def top_rows_per_sport(rows: list[dict], n: int = 3) -> list[dict]:
+    """`top_per_sport` for the dict rows `price_candidates` returns.
+
+    `n <= 0` means NO CAP, and returns every row best-first. The app's control
+    reads "0 = no cap"; passing that through to a plain top-N asked for zero
+    rows per sport, which returned an empty list and crashed the boost panel on
+    `shown[0]` the moment a boost was entered.
+    """
+    def score(r: dict) -> float:
+        # price_candidates rows carry profit_pct; price_boosted_ev rows carry
+        # ev_pct. Reading only the first raised KeyError on the +EV panel.
+        for field in ("profit_pct", "ev_pct"):
+            if field in r:
+                return float(r[field])
+        return 0.0
+
+    if n <= 0:
+        # Both callers hand these over already sorted best-first, and that
+        # order is the point: one ranking across every sport.
+        return list(rows)
+    ordered = sorted(rows, key=score, reverse=True)
+    best: dict[str, list[dict]] = {}
+    for r in ordered:
+        bucket = best.setdefault(r.get("sport_key", ""), [])
+        if len(bucket) < n:
+            bucket.append(r)
+    out = [r for bucket in best.values() for r in bucket]
+    out.sort(key=lambda r: (r.get("sport_title", ""), -score(r)))
+    return out
+
+
+def top_per_sport(opps: list[Opportunity], n: int = 3,
+                  kinds: tuple[str, ...] | None = None) -> list[Opportunity]:
+    """The best `n` per sport, still ranked within each sport.
+
+    A boosted scan does not return a handful of finds -- a 50% boost clears the
+    vig on essentially every two-way market it touches, so one MLB slate alone
+    can produce hundreds. Ranking globally then buries a whole sport under
+    whichever one happens to price widest, so the cut is per sport.
+    """
+    if kinds:
+        opps = [o for o in opps if o.kind in kinds]
+    best: dict[str, list[Opportunity]] = {}
+    for o in sorted(opps, key=lambda x: x.profit_pct, reverse=True):
+        bucket = best.setdefault(o.sport_key, [])
+        if len(bucket) < n:
+            bucket.append(o)
+    out = [o for bucket in best.values() for o in bucket]
+    out.sort(key=lambda o: (o.sport_title, -o.profit_pct))
+    return out
+
+
+def scan(board: Board, cfg, now: datetime | None = None) -> list[Opportunity]:
+    now = now or utcnow()
+    return find_arbitrages(board, cfg, now) + find_middles(board, cfg, now) + find_ev(board, cfg, now)

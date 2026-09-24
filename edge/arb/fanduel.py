@@ -1,0 +1,617 @@
+"""FanDuel sbapi — free player props and alternate lines, no auth.
+
+    /api/content-managed-page?page=CUSTOM&customPageId={league}&_ak={KEY}
+    /api/event-page?eventId={id}&tab={tab}&_ak={KEY}
+
+`_ak` is a static app-wide key in the site's JS, passed as a query param.
+There are no cookies and no rotating token, and the Connecticut host answers
+from anywhere. That makes FanDuel props free, where the aggregator charges
+credits per event for them.
+
+Endpoint shape credit: github.com/sjhouston23/oddswrap
+"""
+from __future__ import annotations
+
+import logging
+import re
+from datetime import datetime, timezone
+
+from . import http as requests
+
+from .models import Board, EventMeta, GroupKey, Quote, field_event
+from .matching import match_event
+from .marketmap import is_full_game
+from .normalize import slug, split_fixture
+
+_FRAC_RE = re.compile(r"\.(\d{1,6})\d*")
+
+log = logging.getLogger("arb.fanduel")
+
+API_KEY = "FhMFpcPWXMeyZxOx"
+BOOK = "fanduel"
+PLAYER_MARKETS = ("pitcher_", "batter_", "player_")
+HOST = "https://sbapi.{state}.sportsbook.fanduel.com/api"
+HEADERS = {"Accept": "application/json",
+           "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/151.0.0.0"}
+
+# league page ids on content-managed-page
+# Sports served by page=SPORT&eventTypeId= rather than a customPageId slug.
+# Tennis has no slug at all -- every guess 404s -- and this is the shape their
+# own app uses.
+EVENT_TYPE_IDS = {"tennis_atp": 2}
+
+LEAGUE_PAGES = {"baseball_mlb": "mlb", "americanfootball_nfl": "nfl",
+                "basketball_nba": "nba", "icehockey_nhl": "nhl",
+                "americanfootball_ncaaf": "ncaaf", "basketball_wnba": "wnba",
+                "golf_pga": "pga"}
+
+# Every sport FanDuel serves, by the eventTypeId `page=SPORT` takes.
+#
+# One call per entry returns the whole sport -- every event, every competition
+# in it, and the main-line markets -- where `customPageId` returns one league
+# and only exists for the handful with a slug. That is the difference between
+# scanning five leagues and scanning the book: eleven requests cover soccer,
+# basketball, hockey, football, MMA, boxing and the rest together.
+#
+# Verified live 2026-08-30. Ids absent here (7 horse racing, 72382) 404; ids
+# that answer with nothing in season (rugby union 5, handball 468328,
+# volleyball 998917, cycling 11, winter sports 451485) are omitted rather than
+# polled for an empty list every scan. `attachments.competitions` then splits
+# the sport into leagues -- see catalog.py, which is what decides the
+# sport_key an event lands under.
+SPORT_EVENT_TYPES = {
+    "soccer": 1, "tennis": 2, "golf": 3, "cricket": 4, "boxing": 6,
+    "motorsport": 8, "rugbyleague": 1477, "darts": 3503, "snooker": 6422,
+    "americanfootball": 6423, "baseball": 7511, "basketball": 7522,
+    "icehockey": 7524, "mma": 26420387, "aussierules": 61420,
+}
+
+# game-level markets
+GAME_MARKETS = {
+    "MONEY_LINE": ("h2h", None),
+    "MATCH_BETTING": ("h2h", None),        # tennis and MMA name their moneyline this way
+    "HEAD_TO_HEAD": ("h2h", None),         # boxing
+    # Soccer's three-way. The hyphens matter: the tolerant fallback below
+    # splits on "_", so this name reaches none of the SPREAD/TOTAL word tests
+    # and without an entry here every soccer moneyline on the board was
+    # dropped -- which is most of what soccer prices.
+    "WIN-DRAW-WIN": ("h2h", None),
+    "MATCH_ODDS": ("h2h", None),
+    "MONEYLINE": ("h2h", None),
+    "RUN_LINE": ("spreads", None),
+    "ALTERNATE_RUN_LINES": ("spreads", None),
+    "SPREAD": ("spreads", None),
+    "ALTERNATE_SPREAD": ("spreads", None),
+    "TOTAL_RUNS": ("totals", None),
+    "ALTERNATE_TOTAL_RUNS": ("totals", None),
+    "TOTAL_POINTS": ("totals", None),
+    "ALTERNATE_TOTAL_POINTS": ("totals", None),
+    "MATCH_HANDICAP_(2-WAY)": ("spreads", None),
+    # Tennis counts sets and games and calls both a handicap. These two are
+    # the whole match; the per-set ones share a marketType with each other and
+    # are refused on their marketName instead -- see ingest_event.
+    "ALTERNATIVE_MATCH_GAME_HANDICAP": ("spreads_games", None),
+    "MATCH_TOTAL_GAMES": ("totals_games", None),
+    "ALTERNATIVE_MATCH_TOTAL_GAMES": ("totals_games", None),
+    "TOTAL_POINTS_(OVER/UNDER)": ("totals", None),
+    "ALTERNATE_MATCH_HANDICAP": ("spreads", None),
+    "ALTERNATE_TOTAL_POINTS_(OVER/UNDER)": ("totals", None),
+}
+
+# Anything naming a period, a single team, or an inning is NOT the full-game
+# market. GroupKey carries no period, so mapping "1ST_HALF_TOTAL_POINTS" to
+# `totals` would pair a half line against a full-game line.
+# "SERIES_" is here for the same reason as "HALF": a playoff-series handicap is
+# not this game's handicap, and SERIES_PLAYER_HANDICAP was reaching the
+# tolerant SPREAD_WORDS fallback on the strength of the word "HANDICAP" alone.
+# NOTE these are only applied to the tolerant fallback, never to the threshold
+# props below -- "TO_HIT_3+_HOME_RUNS" contains "HOME_".
+PERIOD_MARKERS = ("1ST_", "2ND_", "3RD_", "4TH_", "5TH_", "6TH_", "7TH_", "8TH_",
+                  "9TH_", "HALF", "QUARTER", "PERIOD", "INNING", "_TEAM_",
+                  "HOME_TEAM", "AWAY_TEAM", "RACE_TO", "FIRST_", "AWAY_", "HOME_",
+                  "SERIES_",
+                  # PLAYER_A_TOTAL_POINTS is one player's points, and the
+                  # tolerant TOTAL_WORDS fallback was filing it as the GAME
+                  # total -- the same shape as the DraftKings team total. The
+                  # trailing underscore matters: "PLAYER_A" alone is a prefix
+                  # of PLAYER_ASSISTS.
+                  "PLAYER_A_", "PLAYER_B_")
+SPREAD_WORDS = ("HANDICAP", "SPREAD", "RUN_LINE", "PUCK_LINE", "LINE_BETTING")
+TOTAL_WORDS = ("TOTAL_POINTS", "TOTAL_RUNS", "TOTAL_GOALS", "OVER/UNDER")
+
+# the statistic named by a threshold market, e.g. TO_RECORD_2+_HITS -> hits
+STAT_KEYS = {
+    "HITS": "batter_hits", "HOME_RUNS": "batter_home_runs", "HOME_RUN": "batter_home_runs",
+    "RBIS": "batter_rbis", "RBI": "batter_rbis", "TOTAL_BASES": "batter_total_bases",
+    "RUNS": "batter_runs_scored", "SINGLE": "batter_singles", "DOUBLE": "batter_doubles",
+    "TRIPLE": "batter_triples", "STOLEN_BASES": "batter_stolen_bases",
+    "STRIKEOUTS": "pitcher_strikeouts", "OUTS": "pitcher_outs",
+    "HITS+RUNS+RBIS": "batter_hits_runs_rbis",
+}
+# Golf markets that are genuinely two-way, and so can be priced against
+# another book. Everything else golf offers is a field -- Top 5 (29-67
+# runners), Round Leader (33), the outright (150+) -- and a field cannot be
+# arbitraged from a partial list of runners, which is what
+# `test_truncated_outright_field_is_refused` already guards.
+#
+# All three settle head-to-head between exactly two players. A tie is normally
+# a push rather than a loss, which does not break the arithmetic: both legs
+# return their stake, so the position cannot lose. Dead-heat rules differ by
+# book, so confirm the settlement rule before staking a thin one.
+GOLF_TWO_WAY = {
+    "2_BALLS_IMG": "golf_2ball",                       # one round, one pairing
+    "TOURNAMENT_MATCHBETS_IMG": "golf_matchup",        # 72 holes, head to head
+    "WHO_WILL_WIN_A_GROUP_OF_HOLES_IMG": "golf_hole_group",
+}
+
+# markets whose line lives in the runner handicap rather than the name
+HANDICAP_PROPS = {
+    "PITCHER_D_STRIKEOUTS": "pitcher_strikeouts",
+    "PITCHER_STRIKEOUTS": "pitcher_strikeouts",
+    "PITCHER_OUTS": "pitcher_outs",
+}
+
+# "TO_RECORD_2+_HITS", "TO_HIT_3+_HOME_RUNS", "PLAYER_TO_RECORD_A_HIT".
+# `AN?` because FanDuel writes "TO_RECORD_AN_RBI" -- the article agrees with the
+# stat, and requiring a bare "A" silently dropped every RBI threshold.
+THRESHOLD_RE = re.compile(r"(?:TO_RECORD|TO_HIT)_(?:(\d+)\+|AN?)_(.+)$")
+# Pitchers are lettered per event: PITCHER_C_STRIKEOUTS, PITCHER_E_TOTAL_STRIKEOUTS,
+# PITCHER_A_OUTS_RECORDED_SB. The trailing qualifiers are FanDuel's own market
+# variants, not different stats, so they are absorbed rather than enumerated.
+PITCHER_RE = re.compile(
+    r"^PITCHER_[A-Z]_(?:TOTAL_)?(STRIKEOUTS|OUTS|WALKS|HITS|EARNED_RUNS)"
+    r"(?:_RECORDED)?(?:_SB)?$")
+
+# FanDuel's generic single-player prop shape outside baseball:
+#   PLAYER_X_PASSING_YARDS_HIGH        the main line
+#   PLAYER_X_ALT_RECEIVING_YARDS_LOW   an alternate ladder rung
+# HIGH/MEDIUM/LOW are FanDuel's own line-TIER variants of ONE stat, not
+# different stats, so they are absorbed the way PITCHER_RE absorbs
+# _RECORDED/_SB. Verified live 2026-09-06 across three NFL matchups: 34
+# distinct marketTypes, 22 of this shape, and NOT ONE of them mapped -- so
+# FanDuel contributed zero NFL player props against DraftKings' 6,372 and the
+# board looked exactly like a book that posts no football props.
+#
+# THE ANCHOR IS LOAD-BEARING. Three FIELD markets sit right beside these and
+# must never match: MOST_PASSING_YARDS (who leads -- a field with no opposing
+# side), PLAYERS_WITH_10+_YARDS_RECEPTION (also a field), and
+# AWAY_TEAM_DRIVE_X_-_PLAYER_TO_CATCH_A_PASS (one drive, not the full game).
+# None of the three begins "PLAYER_<letter>_", so requiring that prefix
+# excludes them by construction rather than by a deny-list to maintain.
+PLAYER_PROP_RE = re.compile(
+    r"^PLAYER_[A-Z]_(?:ALT_)?(?P<stat>[A-Z0-9_]+?)(?:_(?:HIGH|MEDIUM|LOW))?$")
+# One table serves every sport FanDuel writes this way, which is the point:
+# adding NBA is adding rows here, not writing a second parser.
+PLAYER_PROP_STATS = {
+    # NFL -- verified live 2026-09-06.
+    "PASSING_YARDS": "player_pass_yds",
+    "PASSING_TOUCHDOWNS": "player_pass_tds",
+    "PASSING_ATTEMPTS": "player_pass_attempts",
+    "PASSING_COMPLETIONS": "player_pass_completions",
+    "INTERCEPTIONS": "player_pass_interceptions",
+    "RUSHING_YARDS": "player_rush_yds",
+    "RUSHING_ATTEMPTS": "player_rush_attempts",
+    "RECEIVING_YARDS": "player_reception_yds",
+    "RECEPTIONS": "player_receptions",
+    # Combined stats keep their OWN key so they cannot collide with the part
+    # they contain -- see marketmap.PLAYER_STATS for what it costs when they do.
+    "PASSING_RUSHING_YARDS": "player_pass_rush_yds",
+    "RUSHING_RECEIVING_YARDS": "player_rush_reception_yds",
+    # NBA -- NOT verified: out of season as of 2026-09-06. Probe a real matchup
+    # before NBA DFS ships, exactly the way the NFL rows above were.
+    "POINTS": "player_points",
+    "REBOUNDS": "player_rebounds",
+    "ASSISTS": "player_assists",
+}
+# On alternate ladders the line is in the runner NAME, not the handicap field,
+# which stays 0: "Over 2.5", "Minnesota Twins +6.5". Soccer adds the unit:
+# "Over 2.5 Goals", "Dortmund -1.5 Goals".
+OU_NAME_RE = re.compile(r"^(Over|Under)\s+([+-]?[\d.]+)(?:\s+Goals?)?\s*$", re.I)
+TEAM_LINE_RE = re.compile(r"^(.+?)\s+([+-][\d.]+)(?:\s+Goals?)?\s*$")
+
+# Soccer's full-match goal lines. FanDuel types these by the line itself --
+# OVER_UNDER_25, HOME_TEAM_-1.5_GOALS -- so no word in the tolerant fallback
+# reaches them, and the spread's display name ("2 Way Spread Home Team -1.5
+# Goals") trips the team-total guard on "Home Team", which here names whose
+# handicap it is rather than whose goals are counted. Without these FanDuel
+# contributed the soccer moneyline and nothing else, so a FanDuel soccer token
+# had nowhere else to go.
+#
+# Soccer only: "Over/Under 5.5 Goals" in hockey can be regulation time where
+# another book's total includes overtime. Half-goal lines only, because those
+# cannot push, and a whole or quarter line on a two-way handicap settles
+# differently from book to book.
+SOCCER_MARKETS: tuple[tuple[re.Pattern, str], ...] = (
+    (re.compile(r"^OVER_UNDER_\d5$"), "totals"),
+    (re.compile(r"^(HOME|AWAY)_TEAM_[+-]\d+\.5_GOALS$"), "spreads"),
+)
+
+
+def classify_soccer(market_type: str) -> str | None:
+    """The canonical key for one of SOCCER_MARKETS, or None."""
+    mt = (market_type or "").upper().strip()
+    return next((key for pat, key in SOCCER_MARKETS if pat.match(mt)), None)
+# ALTERNATE_HANDICAP writes the line PARENTHESISED inside the runner name --
+# "New England Patriots (-14.5)" -- and leaves `handicap` at 0. Neither of the
+# forms above matches that, so the name stayed whole, the line came back 0, and
+# every rung of the ladder landed on ONE group at line 0: twenty-two spreads
+# per game, both teams, last one winning. FanDuel's alternate spreads were
+# therefore never usable, which matters because alt ladders are where
+# three-book middles come from.
+TEAM_PAREN_RE = re.compile(r"^(.+?)\s*\(\s*([+-][\d.]+)\s*\)\s*$")
+
+# Player runners come in four shapes and the line is not always in `handicap`.
+SIDE_FIRST_RE = re.compile(r"^(Over|Under)\s+([\d.]+)\s+(.*)$", re.I)
+PLAYER_OU_RE = re.compile(r"^(?P<who>.+?)\s+(?P<side>Over|Under)\s+(?P<line>[\d.]+)\s*$", re.I)
+PLAYER_SIDE_RE = re.compile(r"^(?P<who>.+?)\s+(?P<side>Over|Under)\s*$", re.I)
+PLAYER_LADDER_RE = re.compile(r"^(?P<who>.+?)\s+(?P<n>\d+)\+\s+(?P<stat>.+)$")
+
+
+def parse_player_runner(name: str, handicap) -> tuple[str, str, float] | None:
+    """(side, player, line) from one player runner.
+
+    FanDuel writes the same idea four ways, and which one it uses varies by
+    market rather than by sport:
+
+        "Over 15.5 Dean Kremer"      handicap 0     side and line first
+        "Dean Kremer Over 15.5"      handicap 0     player first (outs recorded)
+        "Luis Castillo Over"         handicap 3.5   line in the handicap field
+        "Luis Castillo 3+ Strikeouts" handicap 0    one rung of an alt ladder
+
+    Only the first was handled. The rest fell to a default that made the WHOLE
+    runner name the player, so the board carried 53 groups keyed
+    'Dean Kremer 3+ Strikeouts' with no line -- and, worse, 'Luis Castillo
+    Over' and 'Luis Castillo Under' as two separate subjects, which is why the
+    two sides of a strikeout line never met each other, let alone another book.
+
+    A ladder rung is converted the same way the threshold markets are: "3+" is
+    Over 2.5, so it lands on the line another book actually prices.
+    """
+    mo = SIDE_FIRST_RE.match(name)
+    if mo:
+        return mo.group(1).lower(), mo.group(3).strip(), float(mo.group(2))
+    mo = PLAYER_OU_RE.match(name)
+    if mo:
+        return mo.group("side").lower(), mo.group("who").strip(), float(mo.group("line"))
+    mo = PLAYER_SIDE_RE.match(name)
+    if mo and handicap:
+        return mo.group("side").lower(), mo.group("who").strip(), float(handicap)
+    mo = PLAYER_LADDER_RE.match(name)
+    if mo:
+        return "over", mo.group("who").strip(), float(mo.group("n")) - 0.5
+    if handicap:
+        return "over", name, float(handicap)
+    return None
+
+
+def classify(market_type: str, sport_key: str | None = None
+             ) -> tuple[str, float | None] | None:
+    """Map a FanDuel marketType to (canonical market, line) or None.
+
+    `sport_key` only matters for tennis: a bare `spreads` or `totals` is the
+    wrong key there, whichever route produced it. See _tennis_unit.
+    """
+    hit = _classify(market_type)
+    if hit is None or not (sport_key or "").startswith("tennis"):
+        return hit
+    return _tennis_unit(market_type, hit[0]), hit[1]
+
+
+def _tennis_unit(market_type: str, mkey: str) -> str:
+    """Re-key a bare tennis spread/total onto the unit it actually counts.
+
+    Tennis handicaps and totals count GAMES or SETS, and those are different
+    bets at wildly different prices -- a set favourite at -1.5 prices around
+    2.5-4.0 where a games favourite at -1.5 prices around 1.3-1.5. The market
+    map already keeps them apart (marketmap.TENNIS_RULES); this is the same
+    statement on FanDuel's side, applied AFTER classification rather than
+    inside it so it catches both routes that produce a bare key:
+
+      * the explicit table -- MATCH_HANDICAP_(2-WAY) and
+        ALTERNATE_MATCH_HANDICAP are tennis market types mapped to `spreads`,
+        and on a live board they put three FanDuel tennis handicaps on a key
+        no other book writes, where they could pair with nothing;
+      * the tolerant SPREAD_WORDS / TOTAL_WORDS fallback, which keys an
+        unrecognised type by the single word HANDICAP or TOTAL in it.
+
+    GAMES IS THE DEFAULT because the standard tennis handicap is a game
+    handicap; a book pricing the set version says SET in the type name.
+    """
+    if "SET" in market_type.upper():
+        return {"spreads": "spreads_sets", "totals": "totals_sets"}.get(mkey, mkey)
+    return {"spreads": "spreads_games", "totals": "totals_games"}.get(mkey, mkey)
+
+
+def _classify(market_type: str) -> tuple[str, float | None] | None:
+    """Map a FanDuel marketType to (canonical market, line) or None.
+
+    Threshold markets are converted the same way DraftKings milestones are:
+    "2+ hits" is Over 1.5, "A hit" is Over 0.5. Without that they never meet
+    another book's Over/Under and cannot be compared.
+    """
+    mt = (market_type or "").upper().strip()
+    if mt in GOLF_TWO_WAY:
+        return GOLF_TWO_WAY[mt], None
+    if mt in GAME_MARKETS:
+        return GAME_MARKETS[mt]
+    if mt in HANDICAP_PROPS:
+        return HANDICAP_PROPS[mt], None
+    pm = PITCHER_RE.match(mt)
+    if pm:
+        return {"STRIKEOUTS": "pitcher_strikeouts", "OUTS": "pitcher_outs",
+                "WALKS": "pitcher_walks", "HITS": "pitcher_hits_allowed",
+                "EARNED_RUNS": "pitcher_earned_runs"}[pm.group(1)], None
+    # Before the tolerant game-market fallback below, deliberately: a player
+    # prop that reached that fallback would be keyed `totals` with no subject
+    # and merge straight into the real game total.
+    ppm = PLAYER_PROP_RE.match(mt)
+    if ppm:
+        key = PLAYER_PROP_STATS.get(ppm.group("stat"))
+        if key:
+            return key, None
+        # A PLAYER_X_ market whose stat is not in the table is DROPPED, never
+        # guessed at, and never allowed to fall through to the game-market
+        # fallback -- that is the whole failure this branch exists to prevent.
+        return None
+    # tolerant fallback for game markets whose exact name varies by sport,
+    # but never for a period or team-specific variant
+    if not any(marker in mt for marker in PERIOD_MARKERS):
+        if any(w in mt for w in SPREAD_WORDS):
+            return "spreads", None
+        if any(w in mt for w in TOTAL_WORDS):
+            return "totals", None
+
+    m = THRESHOLD_RE.search(mt)
+    if m:
+        n = float(m.group(1)) if m.group(1) else 1.0
+        stat = m.group(2).strip("_")
+        # singular and plural both occur: "A_HIT" vs "2+_HITS"
+        key = (STAT_KEYS.get(stat) or STAT_KEYS.get(stat + "S")
+               or STAT_KEYS.get(stat.rstrip("S")))
+        if key:
+            return key, n - 0.5
+    return None
+
+
+def _decimal(runner: dict) -> float | None:
+    odds = (runner.get("winRunnerOdds") or {})
+    d = ((odds.get("trueOdds") or {}).get("decimalOdds") or {}).get("decimalOdds")
+    if isinstance(d, (int, float)) and d > 1.0:
+        return float(d)
+    a = (odds.get("americanDisplayOdds") or {}).get("americanOddsInt")
+    if isinstance(a, (int, float)) and a:
+        from . import oddsmath as om
+        return om.american_to_decimal(float(a))
+    return None
+
+
+def _ts(value) -> datetime:
+    """Parse an ISO timestamp, tolerating .NET-style sub-second precision.
+
+    DraftKings sends "2026-08-29T16:00:00.0000000Z" -- seven fractional
+    digits. Python's fromisoformat accepts only 3 or 6, so this silently
+    fell back to "now" and every event failed to match on start time.
+    """
+    if value is None:
+        return datetime.now(timezone.utc)
+    text = str(value).strip().replace("Z", "+00:00")
+    text = _FRAC_RE.sub(lambda m: "." + m.group(1), text)
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return datetime.now(timezone.utc)
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+class FanDuelScrape:
+    def __init__(self, state: str = "ct", session: requests.Session | None = None):
+        self.base = HOST.format(state=state.lower())
+        self.session = session or requests.Session()
+
+    def _get(self, path: str, **params) -> dict:
+        params["_ak"] = API_KEY
+        r = self.session.get(f"{self.base}/{path}", params=params,
+                             headers=HEADERS, timeout=25)
+        r.raise_for_status()
+        return r.json() or {}
+
+    def league_page(self, sport_key: str) -> dict:
+        etid = EVENT_TYPE_IDS.get(sport_key)
+        if etid is not None:
+            return self._get("content-managed-page", page="SPORT",
+                             eventTypeId=etid, timezone="America/New_York")
+        """One call returning every event in the league AND its main-line
+        markets. Per-event calls are then only needed for props."""
+        page = LEAGUE_PAGES.get(sport_key)
+        if not page:
+            return {}
+        return self._get("content-managed-page", page="CUSTOM", customPageId=page)
+
+    def sport_page(self, event_type_id: int) -> dict:
+        """Every event in one SPORT, with its competitions and main lines.
+
+        `page=SPORT` is the shape FanDuel's own app uses for a sport with no
+        league slug, and it is not limited to those: it answers for all
+        fifteen eventTypeIds in SPORT_EVENT_TYPES and returns more than the
+        per-league page does -- 146 soccer events across 108 competitions in
+        one request. `attachments.competitions` names each league, which is
+        what splits the payload back into sport keys.
+        """
+        return self._get("content-managed-page", page="SPORT",
+                         eventTypeId=event_type_id, timezone="America/New_York")
+
+    def list_events(self, sport_key: str, data: dict | None = None) -> list[tuple[str, str, datetime]]:
+        data = data if data is not None else self.league_page(sport_key)
+        out = []
+        for eid, ev in ((data.get("attachments") or {}).get("events") or {}).items():
+            name, open_date = ev.get("name") or "", ev.get("openDate") or ""
+            # A fixture is "Away @ Home" in a team sport and "A vs B" in an
+            # individual one. Requiring "@" was right while only MLB and the
+            # other US leagues were scanned and silently dropped every soccer,
+            # tennis, MMA and boxing event once they were added -- those are
+            # the sports where props are worth a per-event call.
+            if open_date.startswith("2099") or split_fixture(name) is None:
+                continue          # "MLB Player Markets" and similar containers
+            out.append((str(eid), name, _ts(open_date)))
+        return out
+
+    def event_markets(self, event_id: str, tab: str = "popular") -> dict:
+        return self._get("event-page", eventId=event_id, tab=tab)
+
+    def ingest_event(self, board: Board, payload: dict, sport_key: str,
+                     strict_match: bool = True, sport_key_of=None,
+                     is_main_line: bool = False) -> dict:
+        """Fold a league, sport or single-event payload onto the board.
+
+        `sport_key_of` is how one SPORT payload becomes many leagues: given the
+        event dict it returns the sport_key that event belongs to, or None to
+        skip it. That routing has to happen here rather than by filtering the
+        payload first, because `sport_key` is the join key match_event() keys
+        on -- put every soccer event under one "soccer" key and Bundesliga
+        fixtures would be candidates to match Serie A ones. Omit it and the
+        whole payload takes the `sport_key` argument, as before.
+
+        `is_main_line` marks this as the SPORT page fetch, which "carries
+        exactly ONE line per market -- the main one" (see run.py), as opposed
+        to the per-event `popular` tab where the alternate ladders live.
+        Recorded on the board so an alternate rung can later be checked
+        against the number FanDuel itself currently posts as the line.
+        """
+        stats = {"markets": 0, "quotes": 0, "unmapped": set(), "unmatched": 0,
+                 "skipped_events": 0}
+        att = payload.get("attachments") or {}
+        events, markets = att.get("events") or {}, att.get("markets") or {}
+        now = datetime.now(timezone.utc)
+
+        targets: dict[str, EventMeta] = {}
+        for eid, ev in events.items():
+            if sport_key_of is not None:
+                resolved = sport_key_of(ev)
+                if resolved is None:
+                    stats["skipped_events"] += 1
+                    continue
+                sport_key = resolved
+            name = ev.get("name") or ""
+            pair = split_fixture(name)
+            if pair is not None:
+                away, home = [re.sub(r"\s*\([^)]*\)", "", p).strip() for p in pair]
+                t = match_event(board, home, away, _ts(ev.get("openDate")), sport_key)
+                if t is None:
+                    stats["unmatched"] += 1
+                    if strict_match:
+                        continue
+                    t = EventMeta(f"fd:{eid}", sport_key, sport_key,
+                                  _ts(ev.get("openDate")), home, away)
+            else:
+                # Golf and other non-team sports: the event IS the tournament,
+                # so there is no "away @ home" to split and nothing for
+                # match_event to key on. Requiring that shape dropped every
+                # golf market on the floor -- 37 two-way head-to-heads among
+                # them. Such an event can only be created, never matched onto
+                # an existing one, so it is skipped under strict_match.
+                if strict_match:
+                    continue
+                if sport_key.startswith("golf"):
+                    # collapse to one event per tour: the pairing is the join
+                    # key, and the books do not agree on what an event is
+                    t = field_event(sport_key, _ts(ev.get("openDate")), name.strip())
+                else:
+                    t = EventMeta(f"fd:{eid}", sport_key, sport_key,
+                                  _ts(ev.get("openDate")), name.strip(), None)
+            targets[str(eid)] = t
+        if not targets:
+            return stats
+
+        for m in markets.values():
+            target = targets.get(str(m.get("eventId")))
+            if target is None or m.get("marketStatus") not in (None, "OPEN"):
+                continue
+            stats["markets"] += 1
+            # The marketType is not always enough. FanDuel reuses ONE type
+            # across periods and says which only in marketName: all three of a
+            # tennis match's set handicaps are MAIN_SET_GAME_HANDICAP, named
+            # "Set 1/2/3 Game Handicap", and they landed on one `spreads` key
+            # at the same numbers -- 67 same-book price conflicts in a scan.
+            soccer_key = (classify_soccer(m.get("marketType") or "")
+                          if target.sport_key.startswith("soccer") else None)
+            if soccer_key is not None:
+                hit = (soccer_key, None)
+            else:
+                if not is_full_game(m.get("marketName") or "", sport_key=target.sport_key):
+                    stats["unmapped"].add(m.get("marketName"))
+                    continue
+                hit = classify(m.get("marketType") or "", sport_key)
+            if hit is None:
+                stats["unmapped"].add(m.get("marketType"))
+                continue
+            mkey, fixed_line = hit
+
+            # Golf head-to-heads are all one market key on one event, so
+            # without a subject every pairing in the field collapses into a
+            # single group -- 14 two-balls became one group of 28 "sides".
+            # The subject is the pairing itself, built from the runner names
+            # sorted, so it is derived from the players rather than from the
+            # market label: FanDuel writes "2 Ball (Round 3) - Smalley / T.
+            # Kim" where another book will write it differently, and the pair
+            # of full names is the part both agree on.
+            golf_subject = None
+            if mkey.startswith("golf_"):
+                names = sorted(slug(r.get("runnerName") or "")
+                               for r in (m.get("runners") or [])
+                               if r.get("runnerName"))
+                if len(names) != 2:
+                    stats["unmapped"].add(f"{m.get('marketType')} ({len(names)} runners)")
+                    continue          # not a head-to-head; a field cannot be paired
+                golf_subject = "|".join(names)
+
+            for r in m.get("runners") or []:
+                if r.get("runnerStatus") not in (None, "ACTIVE"):
+                    continue
+                price = _decimal(r)
+                if price is None:
+                    continue
+                name = (r.get("runnerName") or "").strip()
+                handicap = r.get("handicap")
+                # deliberately NOT used to route: see the market-key branch below
+                is_player = bool(r.get("isPlayerSelection"))
+
+                if golf_subject is not None:          # golf head-to-head
+                    side, subject, point = slug(name), golf_subject, None
+                elif fixed_line is not None:          # threshold prop
+                    side, subject, point = "over", name, fixed_line
+                elif mkey.startswith(PLAYER_MARKETS):
+                    # Route on the MARKET, never on isPlayerSelection. In a
+                    # sport played by individuals the runners of an ordinary
+                    # moneyline are people too, and FanDuel flags them -- so
+                    # keying on the flag sent every tennis h2h into the prop
+                    # parser, which found no Over/Under and no ladder rung and
+                    # dropped it. 140 of 144 markets, silently. The market key
+                    # is what actually says whether a line is a prop.
+                    parsed = parse_player_runner(name, handicap)
+                    if parsed is None:
+                        continue
+                    side, subject, point = parsed
+                else:                                  # game market
+                    from .normalize import normalize_outcome
+                    label, line = name, handicap
+                    ou = OU_NAME_RE.match(name)
+                    tp = TEAM_PAREN_RE.match(name)
+                    tl = TEAM_LINE_RE.match(name)
+                    if ou:
+                        label, line = ou.group(1), float(ou.group(2))
+                    elif tp:
+                        label, line = tp.group(1), float(tp.group(2))
+                    elif tl:
+                        label, line = tl.group(1), float(tl.group(2))
+                    norm = normalize_outcome(mkey, label, line, None,
+                                             target.home_team, target.away_team)
+                    if norm is None:
+                        continue
+                    side, subject, point = norm
+
+                board.group(GroupKey(target.event_id, mkey, subject, point),
+                            target).add(Quote(book=BOOK, side=side, decimal=price,
+                                              point=point, last_update=now))
+                stats["quotes"] += 1
+                if is_main_line and mkey in ("totals", "spreads"):
+                    board.record_main_point(target.event_id, mkey, BOOK, point)
+        return stats
