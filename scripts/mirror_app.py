@@ -101,6 +101,30 @@ APPS = {
             "own public timing feeds rather than on odds. Read "
             "`NASCAR_STATUS.md` first."),
     },
+    "mma": {
+        # NOT CREATED YET (2026-09-26): the repo has to exist on GitHub before
+        # --push can publish to it. Until then the MMA page runs inside
+        # edge_search's own app like every other sport.
+        "repo": "https://github.com/raefski/mma_fantasy.git",
+        "title": "DK MMA DFS",
+        "page": "pages/7_🥊_MMA_DFS.py",
+        "profile": "dfs_mma",
+        "docs": ["MMA_STATUS.md", "DRAFTKINGS_ACCESS.md"],
+        # odds_collect.py for push_snapshot, which mma_odds_capture.py reuses.
+        "scripts": ["dfs_lineups_mma.py", "mma_fit.py", "mma_calibration.py",
+                    "mma_odds_capture.py", "odds_collect.py",
+                    "draftables_publish.py", "mirror_app.py"],
+        # The UFCStats mirror is NOT copied: it is public, ~11MB, and
+        # edge/mma.py downloads it from GitHub on first use -- which a
+        # datacenter IP can reach, unlike DraftKings.
+        "tests": ["test_dfs_mma.py"],
+        "blurb": (
+            "MMA is priced where it matters most: DraftKings Sportsbook posts "
+            "winner x method x round for every fight, and the win bonus is most "
+            "of a DK MMA score. The build de-biases those prices (the method "
+            "market underprices decisions), simulates whole fights, and scores "
+            "lineups against a simulated field. Read `MMA_STATUS.md` first."),
+    },
 }
 
 COMMON = [
@@ -287,9 +311,15 @@ def main() -> int:
     if not args.dry_run:
         # A .gitignore that does NOT exclude the snapshots -- they are the whole
         # point of the mirror. Deliberately much shorter than edge_search's.
+        # Also excluded: what a RUN of the app writes into the checkout -- the
+        # UFCStats download (~11MB) and the forward logs, which belong to
+        # edge_search. Found when a test run of the MMA mirror left both
+        # behind for the next `git add -A` to sweep up.
         (dest / ".gitignore").write_text(
             "__pycache__/\n*.pyc\n.env\n.venv/\ndata/cache/\ndata/odds.db*\n"
-            ".pytest_cache/\n")
+            ".pytest_cache/\ndata/mma_cache/\ndata/mma_raw/\n"
+            "data/mma_odds_history/\ndata/dfs_proj_log_*.csv\n"
+            "data/dfs_lineups_*.csv\n")
 
     if args.push and not args.dry_run:
         msg = args.message or f"mirror {args.app} from edge_search"

@@ -205,7 +205,10 @@ def team_list_for_slate(date, draft_group=None, groups=None) -> tuple[list[str],
     gid, is_main, meta = resolve_slate(draft_group, groups, date=date)
     if gid is None:
         return [], {}, meta.get("error")
-    salaries = dfs.fetch_draftables(gid)
+    try:
+        salaries = dfs.fetch_draftables(gid)
+    except dfs.DraftablesUnavailable:
+        salaries = {}
     if not salaries:
         return [], {}, None
     all_teams = sorted({info["team"] for info in salaries.values() if info.get("team")})
@@ -238,9 +241,14 @@ def build_slate(client, date, draft_group=None, iters=800, exclude_teams=None):
     if gid is None:
         return {"error": meta.get("error"), "available": meta.get("available", [])}
 
-    salaries = dfs.fetch_draftables(gid)
+    try:
+        salaries = dfs.fetch_draftables(gid)
+        reason = None
+    except dfs.DraftablesUnavailable as exc:
+        salaries, reason = {}, str(exc)
     if not salaries:
-        return {"unpriced": True, "gid": gid, "is_main": is_main, "meta": meta,
+        return {"unpriced": True, "unpriced_reason": reason, "gid": gid,
+                "is_main": is_main, "meta": meta,
                 "upcoming": dfs.list_slate_names(groups)[:12]}
 
     all_teams = sorted({info["team"] for info in salaries.values() if info.get("team")})
@@ -341,8 +349,9 @@ def build_slate(client, date, draft_group=None, iters=800, exclude_teams=None):
             continue
         # sorted() so pool order is reproducible across machines/processes (a bare
         # set iterates in hash-randomized order, which can shift optimizer tie-breaks).
+        lookup = dfs.SalaryLookup(salaries)
         for nm in sorted({o["description"] for m in dkp["markets"] for o in m["outcomes"] if o.get("description")}):
-            info = salaries.get(dfs.norm(nm))
+            info = lookup.get(nm)
             if not info or not info.get("salary") or "P" not in dfs.parse_pos(info["position"]):
                 continue
             pp_proj = dfs.project_pitcher(dfs.player_markets(dkp, nm))

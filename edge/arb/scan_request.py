@@ -6,13 +6,14 @@ This is the message bus between them, and it is a file in the repo:
 
     phone  -> GitHub contents API -> data/scan_request.json
     desktop poller sees it        -> scrapes -> data/arb_snapshot.json -> push
-    phone  -> reads the new snapshot on the next Cloud redeploy
+    phone  -> reads the new snapshot straight off GitHub (the deployed copy
+              is only the fallback -- Cloud's redeploy-on-push is unreliable)
 
 Git rather than a queue because both ends already have credentials for it and
 it works through a home router with no inbound ports. The costs are real and
 worth naming: a round trip is minutes, not seconds, and every scan is a commit.
 
-Everything here is pure except the two functions that name GitHub in their
+Everything here is pure except the functions that name GitHub in their
 docstring, so the button and the poller share one definition of "is this
 request worth acting on" instead of each guessing.
 """
@@ -23,9 +24,12 @@ import json
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 
+from edge import repo_files
+
 from . import http
 
 REQUEST_PATH = "data/scan_request.json"
+SNAPSHOT_PATH = "data/arb_snapshot.json"
 API = "https://api.github.com"
 
 # The file is committed so the path exists in a fresh clone, but an empty repo
@@ -376,3 +380,23 @@ def put_request(repo: str, token: str, req: ScanRequest, branch: str = "main",
     if r.status_code >= 400:
         raise RequestRefused(_explain(r.status_code, "write", repo))
     return r.json() or {}
+
+
+def latest_snapshot_commit(repo: str, token: str, branch: str = "main",
+                           path: str = SNAPSHOT_PATH, session=None) -> str | None:
+    """Sha of the newest commit on `branch` that touched `path` -- GitHub.
+
+    The cheap half of reading the snapshot off GitHub instead of off the
+    deployed disk: ~4KB and ~0.6s (measured 2026-09-26), so the page can ask
+    every 30 seconds. None if the file has never been committed. The request
+    itself lives in edge/repo_files.py, shared with the DFS and pick'em data.
+    """
+    found = repo_files.latest_commit(repo, token, path, branch, session=session)
+    return found[0] if found else None
+
+
+def fetch_snapshot(repo: str, token: str, ref: str, path: str = SNAPSHOT_PATH,
+                   session=None) -> dict:
+    """The snapshot as of commit `ref`, parsed -- GitHub. See
+    edge/repo_files.fetch for why raw.githubusercontent.com, pinned to a sha."""
+    return json.loads(repo_files.fetch(repo, token, ref, path, session=session))

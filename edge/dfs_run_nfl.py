@@ -291,8 +291,9 @@ def build_pool(client, salaries: dict, book: str = "draftkings") -> tuple[list, 
     stats = {"offense": 0, "dst": 0, "no_proj": 0, "no_salary": 0,
              "not_on_slate": 0, **line_report}
 
+    lookup = dfs.SalaryLookup(salaries)
     for name, markets in props.items():
-        info = salaries.get(dfs.norm(name))
+        info = lookup.get(name)
         if not info:
             stats["not_on_slate"] += 1
             continue
@@ -310,7 +311,7 @@ def build_pool(client, salaries: dict, book: str = "draftkings") -> tuple[list, 
             "salary": info["salary"], "proj": res["proj"], "team": team,
             "opp_team": opp, "game": gid, "dk_pos": info.get("position") or "",
             "components": res.get("components", {}), "means": res.get("means", {}),
-            "dk_fppg": info.get("dk_fppg"),
+            "imputed": res.get("imputed", []), "dk_fppg": info.get("dk_fppg"),
         })
         stats["offense"] += 1
 
@@ -429,7 +430,12 @@ def log_forward_test(pool: list, cash: dict | None, gpp: dict | None,
     with plog.open("w", newline="") as fh:
         w = csv.writer(fh)
         w.writerow(list(PROJ_LOG_COLS))
-        for r in [r for r in prior if r.get("date") != date] + list(_rows()):
+        # Replace only THIS slate's rows. Dropping the whole date wiped the
+        # day's other slates -- NCAAF 2026-09-26 lost slate 153831's 106 rows
+        # when 153951 was built that evening.
+        for r in [r for r in prior
+                  if not (r.get("date") == date and str(r.get("gid")) == str(gid))
+                  ] + list(_rows()):
             w.writerow([r.get(c, "") for c in PROJ_LOG_COLS])
     result["logged"] = True
     result["n"] = len(pool)
@@ -476,7 +482,11 @@ def build_slate(client, draft_group=None, iters: int = 700, book: str = "draftki
     if gid is None:
         return {"error": meta.get("error"), "slates": slates}
 
-    salaries = dfs.fetch_draftables(gid)
+    try:
+        salaries = dfs.fetch_draftables(gid)
+    except dfs.DraftablesUnavailable as exc:
+        return {"unpriced": True, "unpriced_reason": str(exc), "gid": gid,
+                "meta": meta, "slates": slates}
     priced = {k: v for k, v in salaries.items() if v.get("salary")}
     if not priced:
         # DK lists a slate before it prices it; that is normal a few days out

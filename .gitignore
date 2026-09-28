@@ -5,3 +5,8 @@ __pycache__/
 data/cache/
 data/odds.db*
 .pytest_cache/
+data/mma_cache/
+data/mma_raw/
+data/mma_odds_history/
+data/dfs_proj_log_*.csv
+data/dfs_lineups_*.csv

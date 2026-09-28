@@ -80,6 +80,28 @@ def subject_key(subject: str) -> str:
     return ncaaf.norm(_TEAM_SUFFIX.sub("", subject or ""))
 
 
+def salary_index(salaries: dict) -> tuple[dict, list]:
+    """(DK salaries keyed the way a prop subject is, ambiguous keys).
+
+    edge/dfs.fetch_draftables keys with edge.dfs.norm, which KEEPS "Jr." and
+    "III"; a college prop subject drops the suffix ("Michael Hawkins (WVU)"),
+    and subject_key strips it anyway. Joined directly, every suffixed player
+    fell out of the pool: 10 of the 75 with ladders on the 2026-09-26 Night
+    slate, including the quarterback 91% of the cash field played. A key two
+    DK players share is left out rather than guessed.
+    """
+    out: dict = {}
+    dup: set = set()
+    for info in salaries.values():
+        k = ncaaf.norm(info.get("name") or "")
+        if k in out:
+            dup.add(k)
+        out[k] = info
+    for k in dup:
+        out.pop(k, None)
+    return out, sorted(dup)
+
+
 def _parse_time(value) -> datetime | None:
     """DK's '...0000000Z' and a book's '+00:00' into one comparable instant."""
     if not value:
@@ -359,14 +381,15 @@ def build_pool(client, salaries: dict, book: str = "draftkings") -> tuple[list, 
     games = slate_games(salaries)
     opponents = team_opponents(games)
     ladders, event_players = collect_ladders(client, book=book)
+    by_key, ambiguous = salary_index(salaries)
 
     pool: list[dict] = []
     stats = {"projected": 0, "no_proj": 0, "no_salary": 0, "not_on_slate": 0,
              "one_rung": 0, "priced_players": len(ladders),
-             "slate_players": len(salaries)}
+             "slate_players": len(salaries), "ambiguous_names": ambiguous}
 
     for key, by_market in ladders.items():
-        info = salaries.get(key)
+        info = by_key.get(key)
         if not info:
             stats["not_on_slate"] += 1
             continue
@@ -396,7 +419,7 @@ def build_pool(client, salaries: dict, book: str = "draftkings") -> tuple[list, 
         })
         stats["projected"] += 1
 
-    lines, line_report = game_lines(client, games, event_players, salaries)
+    lines, line_report = game_lines(client, games, event_players, by_key)
     for p in pool:
         line = lines.get(p.get("game"))
         if line:
@@ -472,7 +495,12 @@ def log_forward_test(pool: list, cash: dict | None, gpp: dict | None,
     with plog.open("w", newline="") as fh:
         w = csv.writer(fh)
         w.writerow(list(PROJ_LOG_COLS))
-        for r in [r for r in prior if r.get("date") != date] + list(_rows()):
+        # Replace only THIS slate's rows. Dropping the whole date wiped the
+        # day's other slates -- NCAAF 2026-09-26 lost slate 153831's 106 rows
+        # when 153951 was built that evening.
+        for r in [r for r in prior
+                  if not (r.get("date") == date and str(r.get("gid")) == str(gid))
+                  ] + list(_rows()):
             w.writerow([r.get(c, "") for c in PROJ_LOG_COLS])
     result["logged"] = True
     result["n"] = len(pool)
@@ -510,7 +538,11 @@ def build_slate(client, draft_group=None, iters: int = 700, book: str = "draftki
     if gid is None:
         return {"error": meta.get("error"), "slates": slates}
 
-    salaries = dfs.fetch_draftables(gid)
+    try:
+        salaries = dfs.fetch_draftables(gid)
+    except dfs.DraftablesUnavailable as exc:
+        return {"unpriced": True, "unpriced_reason": str(exc), "gid": gid,
+                "meta": meta, "slates": slates}
     priced = {k: v for k, v in salaries.items() if v.get("salary")}
     if not priced:
         return {"unpriced": True, "gid": gid, "meta": meta, "slates": slates}

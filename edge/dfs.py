@@ -97,7 +97,7 @@ def mlb_draft_groups() -> list[dict]:
 #: the snapshot writer filtered on a bare 408 while the reader looked for all
 #: three, so college and NASCAR snapshots reached Streamlit Cloud with the FPPG
 #: column already thrown away.
-FPPG_STAT_IDS = (408, 174, 653)
+FPPG_STAT_IDS = (408, 174, 653, 635)     # 635: MMA's "per fight"
 
 
 def fetch_draftables(draft_group_id: int) -> dict[str, dict]:
@@ -145,7 +145,49 @@ def fetch_draftables(draft_group_id: int) -> dict[str, dict]:
 
 
 _SNAP_DIR = __import__("pathlib").Path(__file__).resolve().parents[1] / "data" / "draftables_snapshot"
-_dt_mod = __import__("datetime")
+
+class SalaryLookup:
+    """Find a sportsbook subject in fetch_draftables' salaries, suffix-tolerant.
+
+    Salaries are keyed with norm(), which KEEPS "Jr."/"Sr."/"III"; the books do
+    not agree on suffixes. On 2026-09-27 DraftKings' own sportsbook listed
+    "James Cook", "Deebo Samuel", "Chris Godwin" and "Aaron Jones" while DK's
+    DFS board had "James Cook III", "Deebo Samuel Sr.", ... -- seven NFL main-
+    slate players silently fell out of the pool, as ten college players had
+    the night before. The exact key is tried FIRST, so every name that matched
+    before matches identically; the suffix-free key is only a fallback, and a
+    suffix-free key two DK players share is never guessed.
+    """
+
+    def __init__(self, salaries: dict):
+        from edge.names import norm as _bare
+        self._bare = _bare
+        self.exact = salaries
+        self.bare: dict = {}
+        dup: set = set()
+        for info in salaries.values():
+            k = _bare(info.get("name") or "")
+            if k in self.bare:
+                dup.add(k)
+            self.bare[k] = info
+        for k in dup:
+            self.bare.pop(k, None)
+        self.ambiguous = sorted(dup)
+
+    def get(self, name: str):
+        return self.exact.get(norm(name)) or self.bare.get(self._bare(name))
+
+
+class DraftablesUnavailable(RuntimeError):
+    """No salaries for a draft group: the live call failed AND no snapshot exists.
+
+    On Streamlit Cloud (datacenter IP, always 403'd) that almost always means DK
+    has not PRICED the slate yet -- the desktop only publishes a snapshot once
+    salaries exist. Every build_slate turns this into {"unpriced": True}; before
+    this it surfaced as a raw 403 traceback ("Build failed") on the phone for
+    NCAAF, NASCAR and MMA on 2026-09-26, each time for next week's slate.
+    """
+
 
 # "live" | "snapshot <when>" | "failed" -- set by _draftables_raw so a caller
 # (the Streamlit pages, scripts/draftables_publish.py) can tell the user which
@@ -171,22 +213,37 @@ def _draftables_raw(draft_group_id: int) -> list[dict]:
         LAST_DRAFTABLES_SOURCE = "live"
         return rows
     except Exception as exc:
-        snap = _SNAP_DIR / f"{draft_group_id}.json"
-        if snap.exists():
+        from edge import repo_files
+        # main's copy on GitHub when Cloud has missed the redeploy that would
+        # have brought it -- which is also what makes a slate DK priced AFTER
+        # the last deploy show up at all (edge/repo_files.py).
+        found = repo_files.read(_SNAP_DIR / f"{draft_group_id}.json")
+        if found is not None:
             # Say so. This fallback silently served 2026-09-18 salaries for a
             # whole day on 09-19 because it looked identical to success from
             # every caller -- the transport was broken, not the IP, and
             # nothing surfaced it. A stale snapshot is still the right answer
             # for Streamlit Cloud (datacenter-blocked by design); it is a
             # BUG SIGNAL on the desktop, where the live call should work.
-            age = _dt_mod.datetime.fromtimestamp(snap.stat().st_mtime)
+            age = found.updated_at.astimezone()
             LAST_DRAFTABLES_SOURCE = f"snapshot {age:%Y-%m-%d %H:%M}"
             print(f"edge.dfs: DK draftables {draft_group_id} live fetch failed "
                   f"({type(exc).__name__}: {exc}) -- falling back to snapshot "
-                  f"saved {age:%Y-%m-%d %H:%M}", file=sys.stderr)
-            return json.loads(snap.read_text())
+                  f"saved {age:%Y-%m-%d %H:%M}"
+                  + (f" (GitHub unreadable: {found.problem})" if found.problem else ""),
+                  file=sys.stderr)
+            return found.json()
         LAST_DRAFTABLES_SOURCE = "failed"
-        raise
+        raise DraftablesUnavailable(
+            f"DraftKings salaries for draft group {draft_group_id} are not "
+            f"available here: the live request failed ({type(exc).__name__}) "
+            "and no snapshot has been published. Usually DK has not priced "
+            "this slate yet.") from exc
+
+
+#: playerGameAttributes the snapshot keeps: MMA fight number (115, 1 = main
+#: event) and weigh-in weight (150). See edge/dfs_run_mma.py.
+SNAPSHOT_GAME_ATTR_IDS = (115, 150)
 
 
 def save_draftables_snapshot(draft_group_id: int) -> int:
@@ -205,6 +262,10 @@ def save_draftables_snapshot(draft_group_id: int) -> int:
     # threaten that.
     keep = ("displayName", "salary", "position", "teamAbbreviation",
             "competition", "draftStatAttributes", "playerId")
+    # MMA reads fight order and weigh-in weight (playerGameAttributes 115 and
+    # 150) and a scratch flag; without them Cloud's MMA board was built from
+    # less than the desktop's. Kept only when present, so no other sport's
+    # snapshot changes.
     rows, seen = [], set()
     for p in _get(url).get("draftables", []):
         r = {k: p.get(k) for k in keep}
@@ -214,6 +275,12 @@ def save_draftables_snapshot(draft_group_id: int) -> int:
         # the writer and the reader cannot disagree about which ids matter.
         r["draftStatAttributes"] = [a for a in (r["draftStatAttributes"] or [])
                                     if a.get("id") in FPPG_STAT_IDS]
+        extra = [a for a in (p.get("playerGameAttributes") or [])
+                 if a.get("id") in SNAPSHOT_GAME_ATTR_IDS]
+        if extra:
+            r["playerGameAttributes"] = extra
+        if p.get("isDisabled"):
+            r["isDisabled"] = True
         key = json.dumps(r, sort_keys=True)
         if key not in seen:  # exact dupes only -- fetch_draftables' first-row-wins stays identical
             seen.add(key)
