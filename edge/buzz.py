@@ -55,6 +55,10 @@ cardinals falcons ravens bills panthers bears bengals browns cowboys broncos
 lions packers texans colts jaguars chiefs raiders chargers rams dolphins vikings
 patriots saints giants jets eagles steelers niners seahawks buccaneers bucs
 titans commanders
+alabama alaska arkansas california colorado connecticut delaware florida georgia
+hawaii idaho illinois indiana iowa kentucky louisiana maine maryland
+massachusetts michigan mississippi missouri montana nebraska nevada ohio oklahoma
+oregon pennsylvania texas utah vermont virginia wisconsin wyoming dakota
 """.split())
 
 FULL, NICK, LAST, FIRST, DST = "full", "nick", "last", "first", "dst"
@@ -93,7 +97,7 @@ def tokenize(text: str) -> list[tuple[str, bool, bool]]:
 #: owners. Never a bare first name. Distinctive ones (Bijan, Baker, Chuba)
 #: still count.
 COMMON_FIRST_NAMES = set("""
-aaron adam alan albert alex alexander andrew andy anthony austin ben benjamin
+aaron adam alan albert alex alexander andre andrew andy anthony austin ben benjamin
 bill billy blake bob bobby brad brandon brett brian bruce bryan carl carson chad
 charles charlie chris christopher cole colin connor cooper craig dan daniel
 darnell dave david dawson dennis derek don donald doug douglas drew dylan ed
@@ -106,6 +110,13 @@ patrick paul pete peter phil philip ralph randy ray raymond rich richard rick
 rob robert roger ron ronald roy russell ryan sam samuel scott sean seth shane
 stephen steve steven ted terry tim timothy todd tom tommy tony travis troy
 tyler vincent walter wayne will william zach zachary
+""".split())
+
+
+CALENDAR = set("""
+monday tuesday wednesday thursday friday saturday sunday january february march
+april may june july august september october november december easter christmas
+thanksgiving halloween
 """.split())
 
 
@@ -171,6 +182,164 @@ def build_aliases(board: list[dict], first_name_counts: Counter | None = None) -
                 and first[0] not in COMMON_FIRST_NAMES):
             aliases[first] = (name, FIRST)
     return aliases
+
+
+#: A learned spelling has to resemble the name it stands for, be seen beside
+#: the other half of that name this often, and point at one player this
+#: consistently.
+VARIANT_MIN_SIMILARITY = 0.6
+VARIANT_MIN_SEEN = 3
+VARIANT_MIN_SHARE = 0.8
+#: Heavy evidence can carry a spelling that only sounds right: "Tyler Shuck"
+#: 111 times on 2026-09-27 is Tyler Shough, though "shuck" scores 0.52 against
+#: "shough" letter for letter.
+VARIANT_STRONG_SEEN = 10
+VARIANT_STRONG_SIMILARITY = 0.45
+VARIANT_STRONG_MARGIN = 0.10
+#: A surname can also be learned with no context at all when it is common and
+#: very close: "Baitman" 348 times is Rashod Bateman, whose first name the
+#: captions also mangle ("Rashad"), so no exact half-name ever sits beside it.
+SOLO_MIN_SEEN = 10
+SOLO_MIN_SIMILARITY = 0.75
+
+
+def _consonants(s: str) -> str:
+    return "".join(c for c in s if c not in "aeiouy")
+
+
+def _similarity(a: str, b: str) -> float:
+    """Captions mangle vowels far more than consonants: "Bejian" is b-j-n like
+    Bijan, not b-r-n like Brian, though letter for letter it is equally close
+    to both. So consonant skeletons count for half."""
+    from difflib import SequenceMatcher
+    return (SequenceMatcher(None, a, b).ratio()
+            + SequenceMatcher(None, _consonants(a), _consonants(b)).ratio()) / 2
+
+
+def _ranked(tok: str, candidates: list) -> tuple:
+    """(best name, its similarity, margin over the runner-up)."""
+    scored = sorted(((_similarity(tok, real), name) for real, name in candidates),
+                    reverse=True)
+    runner_up = scored[1][0] if len(scored) > 1 else 0.0
+    return scored[0][1], scored[0][0], scored[0][0] - runner_up
+
+
+def learn_variants(texts: list[str], board: list[dict], aliases: dict,
+                   known: set | None = None) -> dict:
+    """Caption misspellings of board names, learned from the slate's own
+    transcripts, as extra aliases.
+
+    Automatic captions spell a name the way it sounds. On the 2026-09-20 slate
+    Bijan Robinson was said ~630 times and spelled "Bijan" 17 of them --
+    "Bejon" 331, "Bejian" 148, "Bejan", "Bjon", "Bjan" -- and Ashton Jeanty was
+    "Genty" 182 times and never "Jeanty". Bijan was 46.6% owned; counted by
+    exact spelling he looked like a fringe play. No list written in advance
+    would keep up with this, but the transcripts teach it: "Bejian" keeps
+    turning up right before "Robinson" and looks far more like "Bijan" than
+    like Wan'Dale or Demarcus, so it is Bijan, alone as well as in front of
+    the surname. The same works the other way round ("Ashton Genty"), and a
+    frequent near-spelling of a surname is learned on its own ("Baitman").
+
+    A learned FIRST name is not used on its own when it is mostly followed by
+    somebody else's surname: "Rashad White" (Rachaad) was 20 of the 109
+    "Rashad"s on 2026-09-27 and "Rashad Baitman" (Rashod Bateman) 84.
+
+    Never learned, because they are words or other people: `known` (name
+    tokens of every NFL player on file -- Nico Collins off the slate is not
+    Chig Hollins on it), anything the captions also write in lowercase
+    ("Fantasy" is not Noah Fant), and calendar words ("Saturday" is not Stroud).
+    """
+    by_surname: dict = {}
+    by_first: dict = {}
+    real_tokens: set = set()
+    solo_surnames: list = []
+    for row in board:
+        if row.get("pos") == "DST":
+            continue
+        name = row["name"].strip()
+        first, last = _name_parts(name)
+        real_tokens.update(first + last)
+        if len(first) == 1 and len(last) == 1:
+            by_surname.setdefault(last[0], []).append((first[0], name))
+            by_first.setdefault(first[0], []).append((last[0], name))
+    for surname, players in by_surname.items():
+        if len(players) == 1:
+            solo_surnames.append((surname, players[0][1]))
+
+    known = known or set()
+
+    def usable(tok):
+        return (len(tok) >= 3 and tok not in real_tokens and tok not in known
+                and (tok,) not in aliases and tok not in PLACES
+                and tok not in COMMON_FIRST_NAMES and tok not in CALENDAR)
+
+    def accept(sim, margin, n):
+        if margin < 0.05:
+            return False                    # too close to call between two players
+        return sim >= VARIANT_MIN_SIMILARITY or (
+            n >= VARIANT_STRONG_SEEN and sim >= VARIANT_STRONG_SIMILARITY
+            and margin >= VARIANT_STRONG_MARGIN)
+
+    def is_word(tok):
+        return lower[tok] >= 0.2 * max(1, proper[tok])
+
+    votes: dict = {}
+    proper: Counter = Counter()             # capitalised, mid-sentence uses
+    lower: Counter = Counter()              # lowercase uses: a word, not a name
+    followers: dict = {}                    # token -> capitalised names after it
+    for text in texts:
+        toks = tokenize(text)
+        for i, (a, a_cap, a_sent) in enumerate(toks):
+            if a_cap and not a_sent:
+                proper[a] += 1
+            elif not a_cap:
+                lower[a] += 1
+            if i + 1 == len(toks):
+                break
+            b, b_cap, b_sent = toks[i + 1]
+            if b_cap and not b_sent and len(b) > 1:
+                followers.setdefault(a, Counter())[b] += 1
+            if (a, b) in aliases:
+                continue
+            if a_cap and b in by_surname and usable(a):       # "Bejian Robinson"
+                name, sim, margin = _ranked(a, by_surname[b])
+                votes.setdefault((a, FIRST), {}).setdefault(name, []).append((sim, margin))
+            if b_cap and a in by_first and usable(b):         # "Ashton Genty"
+                name, sim, margin = _ranked(b, by_first[a])
+                votes.setdefault((b, LAST), {}).setdefault(name, []).append((sim, margin))
+
+    learned: dict = {}
+    for (tok, kind), by_name in votes.items():
+        name, seen = max(by_name.items(), key=lambda kv: len(kv[1]))
+        n, total = len(seen), sum(len(v) for v in by_name.values())
+        sim, margin = seen[0]
+        if n < VARIANT_MIN_SEEN or n / total < VARIANT_MIN_SHARE or not accept(sim, margin, n):
+            continue
+        first, last = _name_parts(name)
+        pair = (tok,) + last if kind == FIRST else first + (tok,)
+        learned.setdefault(pair, (name, FULL))
+        if len(tok) < 4 or is_word(tok):    # alone, a fragment ("Ave") or a word is too easy to hit
+            continue
+        if kind == FIRST:
+            after = followers.get(tok, Counter())
+            others = sum(c for t, c in after.items() if t != last[0])
+            if proper[tok] and others / proper[tok] > 0.3:
+                continue                    # "Rashad" is mostly somebody else
+        learned[(tok,)] = (name, kind)
+
+    for tok, n in proper.items():
+        if (n < SOLO_MIN_SEEN or len(tok) < 5 or not usable(tok) or is_word(tok)
+                or (tok,) in learned):
+            continue
+        name, sim, margin = _ranked(tok, solo_surnames) if solo_surnames else (None, 0, 0)
+        if name and sim >= SOLO_MIN_SIMILARITY and margin >= 0.05 and not any(
+                abs(len(k) - len(tok)) <= 2 and _similarity(tok, k) >= sim
+                for k in known - real_tokens):
+            # ...and no player OFF the slate is as close: "Craft" is Tucker
+            # Kraft, not River Cracraft, when only Cracraft is playing.
+            learned[(tok,)] = (name, LAST)
+            learned.setdefault(_name_parts(name)[0] + (tok,), (name, FULL))
+    return learned
 
 
 def is_cased(tokens: list[tuple[str, bool, bool]]) -> bool:

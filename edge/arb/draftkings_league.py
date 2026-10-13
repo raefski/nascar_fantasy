@@ -64,6 +64,11 @@ PROP_CATEGORIES = {
     # that made the NFL ids wrong. Re-run scripts/dk_categories.py once the
     # season opens and correct them before NBA DFS ships.
     1215: "Player Points", 1216: "Player Rebounds", 1217: "Player Assists",
+    # NHL -- verified live 2026-09-28 (scripts/dk_categories.py --sport
+    # icehockey_nhl) on the eve of opening night. Each carries an "O/U"
+    # subcategory (Shots on Goal O/U 12040, Points O/U 16213, Assists O/U 16215,
+    # Saves O/U 16550) plus a one-sided milestone ladder.
+    1189: "Shots on Goal", 1675: "Points", 1676: "Assists", 1064: "Goalie Props",
 }
 # DELIBERATELY EXCLUDED, with reasons:
 #   1003 "TD Scorers"  -- Anytime TD is a FIELD (a list of players, no opposing
@@ -72,6 +77,8 @@ PROP_CATEGORIES = {
 #       arbitraged or devigged pairwise. NFL DFS imputes TDs from a rate model
 #       instead and marks them imputed, the same way project_pitcher imputes
 #       earned runs. Adding it means teaching the board about fields first.
+#   1190 "Goalscorer" (NHL) -- Anytime Goalscorer is a field, same as 1003.
+#       NHL DFS takes goals as Points minus Assists, both two-sided.
 #   1744 "Defensive Props", 1743 "Special Teams", 638 "Kicking" -- real
 #       two-sided markets (Tackles O/U, Sacks O/U), but nothing consumes them
 #       yet: DK Classic scores no defensive player, only a team DST.
@@ -261,6 +268,13 @@ def discover_leagues(sport_slug: str, session=None, timeout: float = 30.0) -> di
                               "Accept": "text/html,application/xhtml+xml"},
                      timeout=timeout)
         if r.status_code != 200:
+            # Since ~2026-10-02 /leagues/{slug} answers 301 -> the homepage,
+            # and curl follows it. The homepage carries the same catalog, so
+            # the body still parses; refusing it on the status alone took
+            # DraftKings tennis and golf discovery to zero leagues.
+            out = parse_league_page(r.text or "", group)
+            if out:
+                return out
             log.warning("dk league page %s: HTTP %s", sport_slug, r.status_code)
             return {}
         out = parse_league_page(r.text, group)
