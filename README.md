@@ -10,7 +10,7 @@
 > ```
 >
 > An edit made here will be silently overwritten on the next mirror. Make it in
-> `edge_search` instead. Last mirrored 2026-10-13.
+> `edge_search` instead. Last mirrored 2026-10-17.
 
 NASCAR scores place differential, laps led and fastest laps, none of which any sportsbook prices. The model is built on NASCAR's own public timing feeds rather than on odds. Read `NASCAR_STATUS.md` first.
 
