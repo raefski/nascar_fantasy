@@ -224,27 +224,74 @@ def season_game_ids(season: int, game_type: int = 2, count: int = 1312) -> list[
 def season_skater_stats(season_id: str, refresh: bool = False) -> dict:
     """{player_id: {...}} season aggregates, merging the NHL's summary and
     realtime reports (the latter has blocked shots, the former short-handed
-    points and shots)."""
+    points and shots).
+
+    ONE request per report (limit=-1). Paging 100 at a time with no sort key
+    returned overlapping pages: the 2025-26 cache held 940 rows but only 929
+    (summary) / 917 (realtime) players, so 34 skaters -- Dahlin, Fox, Robertson
+    among them -- ran on 0.0 blocks or 0.0 goals/shots until 2026-10-22
+    (NHL_CRITIQUE_LOG.md cycle 2). A cache that is not one row per player is
+    refetched; a fetch that is not is refused."""
     out: dict = {}
     for report in ("summary", "realtime"):
         path = CACHE_DIR / f"skater_{report}_{season_id}.json"
-        rows, start = [], 0
-        if path.exists() and not refresh:
-            rows = json.loads(path.read_text())
-        else:
-            while True:
-                url = (f"https://api.nhle.com/stats/rest/en/skater/{report}?limit=100&start={start}"
-                       f"&cayenneExp=seasonId={season_id}%20and%20gameTypeId=2")
-                page = json.loads(_get(url))
-                rows += page.get("data", [])
-                start += 100
-                if start >= page.get("total", 0):
-                    break
+        rows = json.loads(path.read_text()) if path.exists() and not refresh else None
+        if rows is None or len({r["playerId"] for r in rows}) != len(rows):
+            url = (f"https://api.nhle.com/stats/rest/en/skater/{report}?limit=-1"
+                   f"&sort=%5B%7B%22property%22:%22playerId%22,%22direction%22:%22ASC%22%7D%5D"
+                   f"&cayenneExp=seasonId={season_id}%20and%20gameTypeId=2")
+            page = json.loads(_get(url))
+            rows = page.get("data", [])
+            if len({r["playerId"] for r in rows}) != len(rows) or len(rows) != page.get("total"):
+                raise RuntimeError(f"nhl: {report} {season_id}: {len(rows)} rows, "
+                                   f"{len({r['playerId'] for r in rows})} players, total {page.get('total')}")
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(json.dumps(rows))
         for r in rows:
             out.setdefault(r["playerId"], {}).update(r)
     return out
+
+
+def skater_season_to_date(season_id: str, before: str) -> list[dict]:
+    """Each skater's regular-season totals over games dated before `before`:
+    [{id, name, pos, gp, goals, assists, shots, blocks}], from the stats API's
+    summary and realtime reports aggregated with a gameDate filter (one request
+    each, limit=-1). Matched the box scores for 676 of 677 skaters on 10/13
+    (the other: games played 3 vs 4)."""
+    rep = {}
+    for report in ("summary", "realtime"):
+        url = (f"https://api.nhle.com/stats/rest/en/skater/{report}?isAggregate=true&isGame=false"
+               f"&limit=-1&cayenneExp=seasonId={season_id}%20and%20gameTypeId=2"
+               f"%20and%20gameDate%3C%22{before}%22")
+        rows = json.loads(_get(url, timeout=20)).get("data", [])
+        if len({r["playerId"] for r in rows}) != len(rows):
+            raise RuntimeError(f"nhl: {report} to {before}: repeated players")
+        rep[report] = {r["playerId"]: r for r in rows}
+    out = []
+    for pid, r in rep["summary"].items():
+        rt = rep["realtime"].get(pid)
+        if rt is None:
+            continue
+        out.append({"id": pid, "name": r.get("skaterFullName") or "", "pos": r.get("positionCode"),
+                    "gp": r.get("gamesPlayed") or 0, "goals": r.get("goals") or 0,
+                    "assists": r.get("assists") or 0, "shots": r.get("shots") or 0,
+                    "blocks": rt.get("blockedShots") or 0})
+    return out
+
+
+def skater_game_toi(season_id: str, before: str) -> list[dict]:
+    """Every regular-season skater-game of `season_id` dated before `before`
+    (YYYY-MM-DD, the game's local date): [{id, name, team, pos, date, toi}],
+    toi in minutes. One request -- the stats API's game-level ice-time report
+    returns the whole season with limit=-1 (5,507 rows in ~1 s on 2026-10-22).
+    Not cached: a build wants every game up to tonight."""
+    url = ("https://api.nhle.com/stats/rest/en/skater/timeonice?isAggregate=false&isGame=true"
+           f"&limit=-1&cayenneExp=seasonId={season_id}%20and%20gameTypeId=2"
+           f"%20and%20gameDate%3C%22{before}%22")
+    rows = json.loads(_get(url, timeout=20)).get("data", [])
+    return [{"id": r["playerId"], "name": r.get("skaterFullName") or "", "team": r.get("teamAbbrev"),
+             "pos": r.get("positionCode"), "date": (r.get("gameDate") or "")[:10],
+             "toi": (r.get("timeOnIce") or 0) / 60.0} for r in rows]
 
 
 # ---------------------------------------------------------------------------
@@ -260,8 +307,12 @@ def _next_data(url: str) -> dict:
 
 
 #: DailyFaceoff group ids -> what the simulator calls them.
+#: "d4" is DailyFaceoff's 7th defenceman: an 11 F / 7 D lineup lists him
+#: alone in d4 and leaves only two forwards in f4 (COL, DET, LAK, TBL on
+#: 2026-10-19). Dropping him hid the lineup from the board -- see
+#: edge/dfs_run_nhl.seven_d_teams.
 LINE_GROUPS = {"f1": "F1", "f2": "F2", "f3": "F3", "f4": "F4",
-               "d1": "D1", "d2": "D2", "d3": "D3", "pp1": "PP1", "pp2": "PP2",
+               "d1": "D1", "d2": "D2", "d3": "D3", "d4": "D4", "pp1": "PP1", "pp2": "PP2",
                "pk1": "PK1", "pk2": "PK2", "g": "G"}
 
 
@@ -274,7 +325,7 @@ def _snapshot() -> dict:
 def team_lines(abbr: str, live_only: bool = False) -> dict:
     """{player name: {line, pp, pk, pos, injury, gtd, last10, last5}} for one
     team, from DailyFaceoff's current line combinations. `line` is F1-F4 or
-    D1-D3 (or G1/G2 for goalies), `pp` PP1/PP2/None."""
+    D1-D4 (D4 = a 7th defenceman; or G1/G2 for goalies), `pp` PP1/PP2/None."""
     slug = DFO_SLUGS.get(team(abbr))
     if not slug:
         return {}
