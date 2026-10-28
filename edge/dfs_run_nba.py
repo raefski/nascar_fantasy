@@ -22,6 +22,8 @@ Held out on 2025-26: 7.65 DK points mean |error|, 0.765 correlation, against
 """
 from __future__ import annotations
 
+import collections
+
 import csv
 import json
 import logging
@@ -156,6 +158,24 @@ def tonight_status(date: str) -> dict:
     return out
 
 
+def official_index(rows, known: set) -> tuple[dict, dict]:
+    """({norm name: status}, {(last, first initial): [status]}) from the official
+    injury report's rows. The initial fallback exists for a name the report and DK
+    spell differently (Alex / Alexandre Sarr); the report carries no team, so a
+    report name that is itself a known NBA player is never offered to it.
+    2026-10-27: "Justin Champagnie" (WAS) Out matched ("champagnie", "j") and took
+    Julian Champagnie (SAS, 37.8 DK pts, in 34-40% of the Night GPPs' top lineups)
+    off our board -- unique on his DK team, so the 10/26 guard didn't catch it."""
+    from edge import nba_injury_report
+    official, official_sig = {}, {}
+    for last, first, st_, _why in rows:
+        full = nba_injury_report.full_name(last, first)
+        official[norm(full)] = st_
+        if norm(full) not in known:
+            official_sig.setdefault(_sig(full), []).append(st_)
+    return official, official_sig
+
+
 def build_board(gid: int, meta: dict, client=None) -> tuple[list, dict]:
     """(pool, info) for one DK NBA Classic slate: every playable player projected."""
     salaries = dfs.fetch_draftables(gid)
@@ -182,16 +202,14 @@ def build_board(gid: int, meta: dict, client=None) -> tuple[list, dict]:
         from edge import nba_injury_report
         got = nba_injury_report.latest()
         if got:
-            for last, first, st_, _why in got[1]["rows"]:
-                full = nba_injury_report.full_name(last, first)
-                official[norm(full)] = st_
-                official_sig.setdefault(_sig(full), []).append(st_)
+            known = {norm(hp.get("name") or "") for hp in hist["players"].values()}
+            official, official_sig = official_index(got[1]["rows"], known)
         info["injuries_source"] = f"{nba_injury_report.LAST_SOURCE} + {info['injuries_source']}"
 
-    def report_status(name):
+    def report_status(name, sig_ok=True):
         if norm(name) in official:
             return official[norm(name)]
-        alt = official_sig.get(_sig(name), [])
+        alt = official_sig.get(_sig(name), []) if sig_ok else []
         return alt[0] if len(alt) == 1 else None
     implied = game_lines(client, games) if client is not None else {}
     league_pm = hist.get("league_pm")
@@ -223,12 +241,23 @@ def build_board(gid: int, meta: dict, client=None) -> tuple[list, dict]:
         alt = [i for i, hp in hist["players"].items() if hp.get("team") == t and _sig(hp.get("name") or "") == sig]
         return alt[0] if len(alt) == 1 else None
 
-    def status_of(key, t, name):
+    def status_of(key, t, name, sig_ok=True):
         if (key, t) in status:
             return status[(key, t)]
+        if not sig_ok:
+            return {}
         sig = _sig(name)
         alt = [v for (k2, t2), v in status.items() if t2 == t and v.get("sig") == sig]
         return alt[0] if len(alt) == 1 else {}
+
+    # The (last name, first initial) fallbacks below may only name a DK player
+    # whose signature is unique on his DK team. 2026-10-26 OKC had Jalen
+    # Williams (Out) and Jaylin Williams (active, 48.7% owned in the GPP that
+    # paid 2nd $1,500): ESPN's "Jalen Williams" Out matched ("williams", "j",
+    # OKC) and took Jaylin off our board too. The official-report fallback
+    # had the same hole -- it only checked uniqueness on the report's side.
+    dk_sigs = collections.Counter((_sig(v["name"]), team(v.get("team")))
+                                  for v in salaries.values() if v.get("salary"))
 
     rows = []
     for sal in salaries.values():
@@ -236,13 +265,14 @@ def build_board(gid: int, meta: dict, client=None) -> tuple[list, dict]:
             continue
         t = team(sal.get("team"))
         key = norm(sal["name"])
-        st = status_of(key, t, sal["name"])
+        sig_ok = dk_sigs[(_sig(sal["name"]), t)] == 1
+        st = status_of(key, t, sal["name"], sig_ok)
         pid = st.get("id") or history_id(key, t, sal["name"])
         h = hist["players"].get(pid, {}) if pid else {}
         opp = next((team(g["away"]) if team(g["home"]) == t else team(g["home"])
                     for g in games.values() if t in (team(g["home"]), team(g["away"]))), None)
-        espn = (key, t) in espn_out or (_sig(sal["name"]), t) in espn_sig
-        injury = report_status(sal["name"])
+        espn = (key, t) in espn_out or (sig_ok and (_sig(sal["name"]), t) in espn_sig)
+        injury = report_status(sal["name"], sig_ok)
         out = bool(st.get("inactive")) or sal.get("dk_status") in ("OUT", "O") or espn or injury == "Out"
         # `start` lets the optimiser put the LATEST tips in G / F / UTIL (DK's
         # late-swap convention, edge/dfs_opt_climb.assign_slots). Missing until
@@ -319,8 +349,9 @@ def build_board(gid: int, meta: dict, client=None) -> tuple[list, dict]:
         # "Usual" = the same team with no news: everyone healthy who dresses, no
         # starting five announced. Δ = proj - usual is then what tonight's scratches
         # and lineup changes did, not the 240-minute sharing every team goes through.
-        calm = NM.project([{**x, "inactive": bool(next(r for r in ps if r["name"] == x["id"]).get("not_dressing")),
-                            "starter": None} for x in team_in])
+        calm_in = [{**x, "inactive": bool(next(r for r in ps if r["name"] == x["id"]).get("not_dressing")),
+                    "starter": None} for x in team_in]
+        calm = NM.recency(NM.project(calm_in), calm_in, "inactives")   # same recency term (cycle 18)
         allowed = hist["teams"].get(ps[0]["opp"]) if ps else None
         of = NP.opponent_factor(allowed[0] / allowed[1] if allowed and allowed[1] else None, league_pm)
         ef = NP.env_factor(implied.get(t))
@@ -337,6 +368,7 @@ def build_board(gid: int, meta: dict, client=None) -> tuple[list, dict]:
             r["base_min"] = calm.get(r["name"], {}).get("minutes", m.get("base", 0.0))
             r["promoted"] = bool(m.get("promoted"))
             r["rate"] = round(NP.rate(r["history"], r["nba_pos"]), 3)
+            r["recent"] = theory.recent_dk(r["history"], r["cur_n"] or 0, r["n_pre"] if r["preseason"] else 0)   # ownership (SLATE_OWN)
             r["imputed"] = []
             if r["history"]:
                 r["proj"] = round(r["minutes"] * r["rate"] * of * ef, 2)
@@ -406,7 +438,25 @@ def late_swap(pool: list, sim, entered: list[str], priced: dict, mode: str = "gp
 
 
 PROJ_LOG_COLS = ("date", "gid", "player", "team", "opp", "dk_pos", "salary", "minutes", "proj",
-                 "sd", "floor", "ceil", "own", "promoted", "lineup", "imputed", "source")
+                 "sd", "floor", "ceil", "own", "promoted", "lineup", "imputed", "source", "starter", "recent")
+
+
+def optimal_columns(pool: list, sim, nights: int | None = None) -> dict:
+    """{name: {optimal, opt_leverage, boom, bust}} (edge/dfs_optimal.py, Stokastic's
+    columns, 2026-10-27). Not part of build_slate: it is ~130 ms of MILP per night,
+    so the page runs it only when the GPP view is open -- inside every build it
+    helped get the Cloud app CPU-throttled (10/27). 500 nights on the desktop
+    (~13 s on 8 cores), 150 single-process on Cloud's ~2 cores."""
+    import copy
+    import os
+    from edge import dfs_optimal
+    many = (os.cpu_count() or 1) >= 8
+    nights = nights or (500 if many else 150)
+    rows = copy.deepcopy(pool)
+    dfs_optimal.annotate(rows, sim, dfs_opt_nba.SLOTS, dfs_opt_nba.SLOT_OK, dfs_opt_nba.SALARY_CAP,
+                         n=nights, workers=None if many else 1)
+    return {"nights": nights, "rows": {r["name"]: {k: r[k] for k in ("optimal", "opt_leverage", "boom", "bust")}
+                                       for r in rows}}
 
 
 def log_forward_test(pool, cash, gpp, gid, info, root: Path | None = None) -> dict:
@@ -418,7 +468,10 @@ def log_forward_test(pool, cash, gpp, gid, info, root: Path | None = None) -> di
              "proj": p["proj"], "sd": p.get("sd"), "floor": p.get("floor"), "ceil": p.get("ceil"),
              "own": p.get("own", ""), "promoted": int(bool(p.get("promoted"))),
              "lineup": p.get("lineup", ""), "imputed": "|".join(p.get("imputed", [])),
-             "source": "live"} for p in pool]
+             "source": "live",
+             # ownership inputs (SLATE_OWN, CHEAP_STARTER) so the lab replays them
+             "starter": int(bool(p.get("starter"))),
+             "recent": "" if p.get("recent") is None else round(p["recent"], 2)} for p in pool]
     lineups = [{"mode": mode, "slot": slot, "player": p["name"], "team": p["team"],
                 "salary": p["salary"], "proj": p["proj"], "own": p.get("own")}
                for mode, res in (("cash", cash), ("gpp", gpp))

@@ -118,10 +118,9 @@ MS_KAPPA = 3.0
 #: Redistribution of missing minutes (refitted with the split).
 ROLE_POW_V2 = 0.25
 POS_W_V2 = 0.25
-#: The 240 share: m^ALLOC_POW x (1 + STARTER_TILT x starting) (starting = the
-#: announced flag, else the start rate).
-ALLOC_POW = 1.0
-STARTER_TILT = 0.05
+#: (Deleted 2026-10-28: ALLOC_POW / STARTER_TILT, v2's 240 share. Under the rank-gap step
+#: it was unreachable -- a full team returns from rank_gap first -- and removing it changed
+#: no output on 3,000 team-games. The lab keeps its own copy for the v2 ablation chain.)
 #: First, second, third game back from a 5+ team-game absence (fitted 0.75 / 0.85;
 #: 0.8 / 0.9 held out better on 2025-26: first game back bias +3.0 -> -0.6).
 RAMP = (0.8, 0.9, 1.0)
@@ -133,18 +132,17 @@ ROOKIE_PRIOR = (22.19, -4.28)
 ROOKIE_K = 0.5
 #: Undrafted / unknown pick.
 PICK_UNDRAFTED = 70
-#: DK salary on top of the model: minutes = a + b x model + c x salary ($k). It helped v2
-#: (leave one night out, 11 salary nights, 1,517 player-games: MAE 5.141 -> 4.973) only
-#: because v2's 240 step squeezed stars; after critique cycle 1's rank-gap allocation it
-#: adds nothing (4.830 -> 4.834), so it is OFF. (-2.22, 1.031, 0.365) was the v2 fit.
-SALARY_NUDGE = None
+#: (Deleted 2026-10-28: SALARY_NUDGE. DK salary on top of the model helped v2 only because
+#: v2's 240 step squeezed stars; after the rank-gap step it added nothing, 4.830 -> 4.834
+#: MAE, and had been OFF since. (-2.22, 1.031, 0.365) was the v2 fit.)
 #: Critique cycle 1 (NBA_MINUTES_CRITIQUE_LOG.md): the team's gap to 240 is closed by ROLE
 #: RANK. v2 added every inactive regular's minutes back (most of them already out for days,
 #: their absence already in teammates' roles) and then shared 240 in proportion to role, so
 #: stars moved as much as the bench. In the data stars barely move and ranks 8-12 absorb the
 #: gap. Held out 2025-26, starters confirmed: RMSE 6.810 -> 6.692, MAE 5.26 -> 5.03;
 #: inactives only 7.649 -> 7.474. Coefficients: edge/nba_minutes_gap.py (generated).
-ALLOC = "rank_gap"
+#: A full team (FULL_ROSTER+ active) always takes it; a short-handed one keeps the
+#: redistribution below (ROLE_POW_V2 / POS_W_V2).
 #: Critique cycle 2: is the coach playing him RIGHT NOW? A non-starter's role (bench role
 #: once the five is announced; start rate < 0.5 before) moves RECENCY_LAM of the way to his
 #: last game's minutes (a DNP counts 0), if his start rate < RECENCY_TAU; a regular starter
@@ -337,8 +335,8 @@ def project(team: list, params: dict | None = None) -> dict:
     Returns {id: {"minutes", "base", "promoted", "share"}} for active players."""
     import math
 
-    p = {"ROLE_POW": ROLE_POW_V2, "POS_W": POS_W_V2, "ALLOC_POW": ALLOC_POW, "STARTER_TILT": STARTER_TILT,
-         "RAMP": RAMP, "ROOKIE_PRIOR": ROOKIE_PRIOR, "ROOKIE_K": ROOKIE_K, "SALARY_NUDGE": SALARY_NUDGE,
+    p = {"ROLE_POW": ROLE_POW_V2, "POS_W": POS_W_V2,
+         "RAMP": RAMP, "ROOKIE_PRIOR": ROOKIE_PRIOR, "ROOKIE_K": ROOKIE_K,
          "RECENCY_LAM": RECENCY_LAM, "DROP_Q": DROP_Q, "EXPECTED_W": EXPECTED_W,
          **(params or {})}
     if p["EXPECTED_W"] is not None and any(pl.get("starter") and pl.get("confirmed") is False for pl in team):
@@ -383,11 +381,13 @@ def project(team: list, params: dict | None = None) -> dict:
         sr = pl.get("since_return")
         if sr is not None and 0 <= sr < len(p["RAMP"]):
             b *= p["RAMP"][sr]
-        roles_[pl["id"]] = max(0.0, b)
+        # cycle 17: a limited Doubtful / Questionable player's role x K (project_uncertain);
+        # the 240 step then re-shares what he gives up
+        roles_[pl["id"]] = max(0.0, b) * float(pl.get("role_scale", 1.0))
         start_[pl["id"]] = (1.0 if pl["starter"] else 0.0) if pl.get("starter") is not None else s
         promoted[pl["id"]] = bool(pl.get("starter")) and r["start_rate"] < 0.5
     active = [pl for pl in team if not pl["inactive"]]
-    if p.get("ALLOC", ALLOC) == "rank_gap" and len(active) >= FULL_ROSTER:
+    if len(active) >= FULL_ROSTER:
         from edge.nba_minutes_gap import GAP_COEF
         mode = "confirmed" if any(pl.get("starter") is not None for pl in team) else "inactives"
         mins, slope = rank_gap({pl["id"]: roles_[pl["id"]] for pl in active}, GAP_COEF[mode])
@@ -407,25 +407,6 @@ def project(team: list, params: dict | None = None) -> dict:
         weights[pl["id"]] = max(roles_[pl["id"]], 1.0) ** p["ROLE_POW"] * (1 + p["POS_W"] * min(1.0, share))
     tw = sum(weights.values()) or 1.0
     mins = {pl["id"]: min(48.0, max(0.0, roles_[pl["id"]] + missing * weights[pl["id"]] / tw)) for pl in active}
-    if sum(mins.values()) > 0 and len(active) >= FULL_ROSTER:
-        w = {i: max(m, 0.0) ** p["ALLOC_POW"] * (1 + p["STARTER_TILT"] * start_[i]) for i, m in mins.items()}
-        free, fixed, trial = dict(w), {}, {}
-        for _ in range(5):                      # nobody past 48: cap and re-share the rest
-            room = TEAM_MIN - sum(fixed.values())
-            ws = sum(free.values()) or 1.0
-            trial = {i: room * x / ws for i, x in free.items()}
-            over = [i for i, m in trial.items() if m > 48.0]
-            if not over:
-                break
-            for i in over:
-                fixed[i] = 48.0
-                free.pop(i)
-        mins = {**trial, **fixed}
-    nudge = p["SALARY_NUDGE"]
-    if nudge and active and all(pl.get("salary") for pl in active):
-        a0, a1, a2 = nudge
-        mins = {pl["id"]: min(48.0, max(0.0, a0 + a1 * mins[pl["id"]] + a2 * pl["salary"] / 1000.0))
-                for pl in active}
     return {pl["id"]: {"minutes": round(mins[pl["id"]], 1), "base": round(roles_[pl["id"]], 1),
                        "promoted": promoted[pl["id"]], "share": round(weights[pl["id"]] / tw, 3)}
             for pl in active}
@@ -470,10 +451,12 @@ def project_uncertain(team: list, unc: dict, mode: str, keeps: dict | None = Non
     (the roster cut re-run; None = everyone not inactive). With A = all dress and B_k =
     k sits, and P(dress) p by (category, role >= REPORT_ROLE):
         m_i = A_i + sum over uncertain k != i of (1 - p_k) (B_k,i - A_i),   x p_i if i is uncertain
+    on his limit for a Doubtful / Questionable player: role x REPORT_K, the rest re-shared
+    by the 240 step (cycles 16-17).
     Mirrors scripts/nba_minutes_lab.report_score. Returns (minutes as project(), {id: p})."""
     a = project(team, params)
     if not unc:
-        return a, {}
+        return recency(a, team, mode), {}
     probs = probs or REPORT_P[mode]
     by_id = {pl["id"]: pl for pl in team}
     p = {}
@@ -486,15 +469,90 @@ def project_uncertain(team: list, unc: dict, mode: str, keeps: dict | None = Non
         kept = None if keeps is None else keeps.get(k)
         B[k] = project([{**pl, "inactive": pl["id"] == k or (pl["inactive"] if kept is None else pl["id"] not in kept)}
                         for pl in team], params)
+    # cycle 17: L_k = k dresses on his limit (role x REPORT_K), the 240 step re-sharing the rest
+    kq = REPORT_K.get(mode, {})
+    Lk = {k: project([{**pl, "role_scale": kq[c]} if pl["id"] == k else pl for pl in team], params)
+          for k, c in unc.items() if c in kq}
     out = {}
     for i in set(a) | {i for b in B.values() for i in b}:
         ai = a.get(i, {}).get("minutes", 0.0)
-        m = ai + sum((1 - p[k]) * (B[k].get(i, {}).get("minutes", 0.0) - ai) for k in unc if k != i)
-        if i in unc:
-            m *= p[i]
+        sits = sum((1 - p[k]) * (B[k].get(i, {}).get("minutes", 0.0) - ai) for k in unc if k != i)
+        if i in Lk:                  # his own minutes: on his limit, as re-shared
+            m = (Lk[i].get(i, {}).get("minutes", 0.0) + sits) * p[i]
+        else:
+            m = ai + sits + sum(p[k] * (Lk[k].get(i, {}).get("minutes", 0.0) - ai) for k in Lk if k != i)
+            if i in unc:
+                m *= p[i]
         base = a.get(i) or next(B[k][i] for k in unc if i in B[k])
         out[i] = {**base, "minutes": round(max(0.0, m), 1)}
-    return out, p
+    return recency(out, team, mode, p), p
+
+#: Critique cycle 18 (2026-10-28): the role trails the last few games. What is left of the
+#: error after the whole pipeline (report replay, 240 step, REPORT_K re-share) still
+#: tracks how far a player's last 3 dressed games THIS season (DNP zeros counted) sit from
+#: his projection. Correction c x (last3 - m) by (state, starter), least squares through
+#: zero on 2024-25 only (n 31,388 dressed rows per state); then the team's corrections are
+#: made zero-sum, so the 240 total is untouched. "Starter" = the posted five when it is
+#: posted, else start_rate >= 0.5 (the actual start is not known before lock). Held out
+#: 2025-26, report replay, zero-sum over every kept player (who dresses is unknown
+#: pre-lock), n 31,218 dressed: confirmed RMSE/MAE 6.2704/4.7069 -> 6.2142/4.6673, no five
+#: 6.5672/4.9033 -> 6.5599/4.8916 (NBA_MINUTES_CRITIQUE_LOG.md cycle 18;
+#: scripts/critic/nba_recency_fix/).
+RECENT_C = {"confirmed": (0.080, 0.168), "inactives": (0.144, 0.051)}   # (starter, bench)
+RECENT_N = 3
+
+
+def recency(out: dict, team: list, mode: str, p: dict | None = None) -> dict:
+    """Critique cycle 18: shift each dressing player toward his last RECENT_N games this
+    season (RECENT_C), zero-sum within the team. An uncertain player is corrected on his
+    minutes IF he dresses (m / p), then scaled back by p. Scored by scripts/critic/nba_recency_fix/."""
+    cs, cb = RECENT_C.get(mode, (0.0, 0.0))
+    p = p or {}
+    by_id = {pl["id"]: pl for pl in team}
+    corr = {}
+    for i, o in out.items():
+        pl = by_id.get(i)
+        pi = p.get(i, 1.0)
+        if pl is None or pl.get("inactive") or pi <= 0 or o["minutes"] <= 0:
+            continue
+        n_pre = int(pl.get("n_pre") or 0)
+        real = list(pl["history"][: len(pl["history"]) - n_pre]) if n_pre else list(pl["history"])
+        cur = len(real) if pl.get("cur_n") is None else max(0, min(int(pl["cur_n"]), len(real)))
+        last = [m for m, _ in real[len(real) - cur:]][-RECENT_N:]
+        if not last:
+            corr[i] = 0.0
+            continue
+        if mode == "confirmed" and pl.get("starter") is not None:
+            st = bool(pl.get("starter"))
+        else:
+            st = role_v2(pl["history"], pl.get("cur_n"), n_pre)["start_rate"] >= 0.5
+        corr[i] = (cs if st else cb) * (sum(last) / len(last) - o["minutes"] / pi)
+    if not corr:
+        return out
+    mean = sum(corr.values()) / len(corr)
+    res = dict(out)
+    for i, c in corr.items():
+        pi = p.get(i, 1.0)
+        res[i] = {**out[i], "minutes": round(max(0.0, (out[i]["minutes"] / pi + c - mean) * pi), 1)}
+    return res
+
+
+#: Critique cycle 16 (2026-10-28): a Doubtful / Questionable player who DOES dress plays on
+#: a limit -- the cycle 7 hedge only priced whether he dresses. His minutes given he dresses
+#: are K x the model's. Fitted on 2024-25 (OLS through 0 on dressed players, official-report
+#: replay, phantoms out): confirmed Doubtful 0.0 (n 8), Questionable 0.688 (n 116); no five
+#: Doubtful 0.202 (n 9), Questionable 0.766 (n 191). Held out 2025-26, active RMSE / MAE:
+#: confirmed 6.301/4.724 -> 6.271/4.707, no five 6.641/4.919 -> 6.575/4.909 (board 6.291 ->
+#: 6.269, 6.844 -> 6.795); held-out Doubtful dressers n 39: bias +21.0 -> +4.3 (no five),
+#: Questionable n 378 +4.2 -> -1.6. Probable / stale fit ~1.0 and did not help: left at 1.
+#: Cycle 17 (same day): those minutes are RE-SHARED through the 240 step (L_k in
+#: project_uncertain) and confirmed Questionable K refit under it on 2024-25 (grid x0.8-1.2:
+#: x1.1 -> 0.757; no five kept x1.0). Held out 2025-26 vs cycle 16, active RMSE / MAE:
+#: confirmed 6.2713/4.7070 -> 6.2704/4.7068, no five 6.5748/4.9089 -> 6.5672/4.9033, board
+#: 6.795 -> 6.786, no-five bias -0.34 -> -0.25 (train confirmed 6.0516 -> 6.0524).
+REPORT_K = {"confirmed": {"Doubtful": 0.0, "Questionable": 0.757},
+            "inactives": {"Doubtful": 0.202, "Questionable": 0.766}}
+
 
 #: Role ranks with their own allocation cell; rank 14 and below share the last one.
 GAP_RANKS = 13
