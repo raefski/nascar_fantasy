@@ -57,10 +57,12 @@ FEEDS: tuple[str, ...] = (
     "data/nhl_lines_snapshot.json",       # scripts/nhl_lines_publish.py
     "data/nba_lineups_snapshot.json",     # harness/nba_scratch.py
     "data/nba_player_history.json",       # scripts/nba_history_publish.py
+    "data/nba_courtiq.json",              # scripts/nba_history_publish.py (pages/14 CourtIQ)
     "data/buzz_*.csv",                    # scripts/buzz_{nfl,nhl,ncaaf}.py
     "data/pickem_current_week.csv",       # scripts/pickem_pool_fetch.py
     "data/pickem_line_log.csv",           # scripts/pickem_capture.py
     "data/dfs_proj_log*.csv",             # scripts/dfs_autolog.py (+ CLI builds)
+    "data/dfs_proj_history_*.csv",        # every logged build, stamped built_at (dfs_forward_log)
     "data/dfs_lineups_*.csv",             # scripts/dfs_autolog.py
     "data/overlay_payouts_live.json",     # harness/overlay.py (the page prices from it)
 )
