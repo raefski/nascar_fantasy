@@ -73,6 +73,44 @@ MATCH_TOLERANCE = timedelta(hours=6)
 LADDER_MARKETS = ("player_pass_yds", "player_pass_tds", "player_pass_attempts",
                   "player_rush_yds", "player_reception_yds", "player_receptions")
 
+#: A QUARTERBACK'S RUSHING TOUCHDOWNS COME FROM HIS SEASON, not his yardage.
+#: DK posts no college TD market we collect, so rush TDs were imputed at rush
+#: yards / 110 (dfs_sport.NCAAF_RUSH_TD_PER_YARD_QB) -- a league-wide rate that
+#: knows nothing about who runs at the goal line. Critique cycle 3, 2026-11-07
+#: (NCAAF_CRITIQUE_LOG.md, scripts/ncaaf_lab.py report --qb-rush-td): his own
+#: cfbfastR rush TDs per team game, weeks before the slate, no shrinkage (k=0
+#: chosen on train: 5 slates, 9/26-10/16, 46 of 48 QBs). Held out on 6 slates
+#: (10/17-11/6, 351 players): MAE 6.03 -> 5.93, QB 6.78 -> 6.19 (n=63), better
+#: on 5 of 6 slates; with 10/17's two draft groups counted once, 6.01 -> 5.92.
+#: Below 2 team games, or a name two players share, the yards rule stays.
+QB_RUSH_TD_MIN_TEAM_GAMES = 2
+#: Written daily by scripts/ncaaf_qb_rates_publish.py from cfbfastR, published
+#: to the data branch, read through edge/repo_files (the phone sees new rates
+#: without a reboot).
+QB_RUSH_TD_PATH = ROOT / "data" / "ncaaf_qb_rush_td.json"
+
+
+def load_qb_rush_rates(path: Path = QB_RUSH_TD_PATH) -> tuple[dict, str]:
+    """({normalised name: rate row}, where it came from). A missing table is
+    not an error -- every QB falls back to yards/110 -- but it is SAID: the
+    source string lands in the build's stats and on the page."""
+    from edge import repo_files
+    try:
+        found = repo_files.read(path)
+    except Exception as exc:                                # noqa: BLE001
+        return {}, f"unreadable ({type(exc).__name__}): yards/110 for every QB"
+    if found is None:
+        return {}, "missing: yards/110 for every QB"
+    try:
+        doc = found.json()
+    except ValueError:
+        return {}, "unparseable: yards/110 for every QB"
+    age_h = (datetime.now(timezone.utc) - found.updated_at).total_seconds() / 3600
+    return (doc.get("players") or {}), (
+        f"{found.source}, through cfbfastR week {doc.get('through_week')}, {age_h:.0f}h old"
+        + (f" ({found.problem})" if found.problem else ""))
+
+
 #: DraftKings writes a prop subject as "Jeremiah Smith (OSU)" and a draftable
 #: as "Jeremiah Smith". Both are DraftKings, so the join is exact once the
 #: team suffix is off -- no fuzzy matching, unlike the NFL's team-name aliasing.
@@ -231,7 +269,8 @@ def collect_ladders_by_event(client, markets=LADDER_MARKETS,
     return by_event, kickoffs
 
 
-def project_player(ladders: dict, sport, position: str | None = None) -> dict:
+def project_player(ladders: dict, sport, position: str | None = None,
+                   rush_td_mean: float | None = None) -> dict:
     """One player's ladders -> a DK projection, through the shared assembler.
 
     Two halves, and the split is the point:
@@ -265,6 +304,9 @@ def project_player(ladders: dict, sport, position: str | None = None) -> dict:
 
     if not any(m in means for m in sport.required):
         return {"proj": None}
+    if rush_td_mean is not None:
+        # a season rate (QB_RUSH_TD_*): _ncaaf_impute only fills an ABSENT mean
+        means["player_rush_tds"] = rush_td_mean
 
     bonus_probs = {}
     for b in sport.bonuses:
@@ -293,6 +335,55 @@ def project_player(ladders: dict, sport, position: str | None = None) -> dict:
 # ---------------------------------------------------------------------------
 # The pool
 # ---------------------------------------------------------------------------
+#: Book order for a game line: DraftKings first (its sportsbook prices the
+#: slate's own props), then the others.
+LINE_BOOKS = ("draftkings", "fanduel", "fanatics")
+
+
+def main_line(ev: dict, market: str, side: str | None) -> float | None:
+    """`side`'s point on the MAIN line of a two-way game market: the pair
+    priced closest to even, from the first book in LINE_BOOKS that has one.
+
+    The pool reads odds with main_line_only=False (college props are ladders),
+    and that client hands game markets over WITH their alternate rungs too:
+    on 2026-11-07 Georgia @ Ole Miss carried 86 DraftKings totals outcomes from
+    36.5 up, and the first one seen was the total. The old reader took the
+    first `point` from whichever book came first (36.5, 49.5 and 56.5 on one
+    game) and never filled the spread. Replayed slates showed totals of 21.5
+    and 25.5. The main line is the one the book prices closest to a coin flip;
+    the main-line client agrees with this rule (checked in tests)."""
+    if not side:
+        return None
+    books = {bk.get("key"): bk for bk in ev.get("bookmakers", [])}
+    for key in [*LINE_BOOKS, *[k for k in books if k not in LINE_BOOKS]]:
+        bk = books.get(key)
+        if not bk:
+            continue
+        for m in bk.get("markets", []):
+            if m.get("key") != market:
+                continue
+            outs = [o for o in m.get("outcomes", [])
+                    if o.get("point") is not None and o.get("price")]
+            best = None
+            for o in outs:
+                if o.get("name") != side:
+                    continue
+                # the partner: Under at the same total, or the other team at
+                # the negated spread (Ole Miss +3.5 pairs Georgia -3.5; the
+                # alternate Georgia +3.5 is a different bet)
+                want = float(o["point"]) * (1 if market == "totals" else -1)
+                partner = [q for q in outs if q.get("name") != side
+                           and abs(float(q["point"]) - want) < 1e-9]
+                if len(partner) != 1:
+                    continue
+                gap = abs(1.0 / o["price"] - 1.0 / partner[0]["price"])
+                if best is None or gap < best[0]:
+                    best = (gap, float(o["point"]))
+            if best is not None:
+                return best[1]
+    return None
+
+
 def game_lines(client, games: dict, event_players: dict,
                salaries: dict) -> tuple[dict, dict]:
     """{game_id: {total, spread_home, home}} for the slate's games only.
@@ -339,12 +430,8 @@ def game_lines(client, games: dict, event_players: dict,
             report["unmatched_events"] += 1
             continue
         home = games[gid]["home"]
-        total = spread_home = None
-        for bk in ev.get("bookmakers", []):
-            for m in bk.get("markets", []):
-                for o in m.get("outcomes", []):
-                    if m["key"] == "totals" and total is None and o.get("point") is not None:
-                        total = float(o["point"])
+        total = main_line(ev, "totals", "Over")
+        spread_home = main_line(ev, "spreads", ev.get("home_team"))
         if total is not None and gid not in lines:
             lines[gid] = {"total": total, "spread_home": spread_home, "home": home}
     report["missing_games"] = sorted(g["matchup"] for gid, g in games.items()
@@ -501,15 +588,21 @@ def join_ladders(by_event: dict, kickoffs: dict, salaries: dict, subjects: dict,
     return joins
 
 
-def build_pool(client, salaries: dict, book: str = "draftkings") -> tuple[list, dict]:
-    """The projected player pool for one slate."""
+def build_pool(client, salaries: dict, book: str = "draftkings",
+               qb_rates: dict | None = None) -> tuple[list, dict]:
+    """The projected player pool for one slate. `qb_rates` (tests, replays)
+    overrides the published QB rush-TD table."""
     sport = dfs_sport.get(SPORT)
     games = slate_games(salaries)
     opponents = team_opponents(games)
     subjects: dict = {}
     by_event, kickoffs = collect_ladders_by_event(client, book=book, subjects=subjects)
     stats = {"projected": 0, "no_proj": 0, "no_salary": 0, "not_on_slate": 0,
-             "one_rung": 0, "slate_players": len(salaries)}
+             "one_rung": 0, "slate_players": len(salaries), "qb_rush_td_season": 0}
+    if qb_rates is None:
+        qb_rates, stats["qb_rush_td_source"] = load_qb_rush_rates()
+    else:
+        stats["qb_rush_td_source"] = "given"
     joins = join_ladders(by_event, kickoffs, salaries, subjects, stats)
 
     pool: list[dict] = []
@@ -522,7 +615,13 @@ def build_pool(client, salaries: dict, book: str = "draftkings") -> tuple[list, 
             # main_line_only left ON. Counted, not silently projected.
             stats["one_rung"] += 1
             continue
-        res = project_player(by_market, sport, position=info.get("position"))
+        rate = None
+        if ncaaf.base_position(info.get("position")) == "QB":
+            got = qb_rates.get(ncaaf.norm(info["name"]))
+            if got and got.get("team_games", 0) >= QB_RUSH_TD_MIN_TEAM_GAMES:
+                rate = float(got["rate"])
+        res = project_player(by_market, sport, position=info.get("position"),
+                             rush_td_mean=rate)
         if res.get("proj") is None:
             stats["no_proj"] += 1
             continue
@@ -537,8 +636,10 @@ def build_pool(client, salaries: dict, book: str = "draftkings") -> tuple[list, 
             "imputed": res.get("imputed", []), "ladders": res.get("ladders", {}),
             "band_points": res.get("band_points", 0.0),
             "dk_fppg": info.get("dk_fppg"),
+            "rush_td_source": "season" if rate is not None else "yards",
         })
         stats["projected"] += 1
+        stats["qb_rush_td_season"] += rate is not None
 
     event_players = {ev: set(players) for ev, players in by_event.items()}
     lines, line_report = game_lines(client, games, event_players, salary_index(salaries)[0])

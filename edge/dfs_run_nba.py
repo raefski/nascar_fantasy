@@ -38,7 +38,7 @@ from edge import nba_project as NP
 from edge.dfs_slate import parse_time as _parse_time, slate_games
 from edge import nba
 from edge.nba import TEAM_NAME_TO_ABBR
-from edge.names import norm
+from edge.names import first_names_agree, norm
 
 log = logging.getLogger(__name__)
 ROOT = Path(__file__).resolve().parents[1]
@@ -56,6 +56,16 @@ IMPUTED_PER_K = 4.5
 #: role >= 10), 2024-25 fit: cut 13 / 14 / 15 / none RMSE 6.478 / 6.467 / 6.465 / 6.477;
 #: 2025-26 held out 6.655 / 6.634 / 6.634 / 6.644 (scripts/nba_minutes_lab.py live).
 ACTIVE_ROSTER = 15
+#: Critique cycle 25 (2026-11-07): NBA.com's EXPECTED five skipped the injury-report hedge
+#: (only "announced" was checked), so an Expected starter on the report got P(dress) 1 and
+#: starter minutes; 2026-27, Questionable Expected starters dressed 45% (n 31) and played
+#: 12.5 min on average. Now hedged with the 2024-25 no-five REPORT_P (nothing fitted on
+#: 2026-27). scripts/nba_expected_replay.py, production team_minutes, 2026-27 (204
+#: team-games, 14 nights), board RMSE off -> on: five + report as of tip-90 5.843 -> 5.710
+#: (sq. error per row -1.54 [90% -2.44, -0.76] by night; the 51 affected rows 15.96 ->
+#: 12.80, bias +7.43 -> +2.56); tip-45 5.489 -> 5.485 (11 rows, noise); tip-30 5.437 ->
+#: 5.437 (3 rows). Five known / no five: unchanged (no Expected starter).
+EXPECTED_HEDGE = True
 ET = ZoneInfo("America/New_York")
 #: First regular-season night. Before it, DK's slates are PRESEASON games, where
 #: starters play 15-25 minutes -- the projections assume regular-season roles.
@@ -187,6 +197,113 @@ def _sig(name: str) -> tuple:
     return (norm(parts[-1]), parts[0][:1].lower()) if len(parts) >= 2 else (norm(name), "")
 
 
+# ---- DK player props -> the market's DK points (critique cycle 27, 2026-11-08) ----
+# The critic found the board ignored the props the dfs_nba scan has collected since 10/15:
+# on prop-covered players, actual ~ 4.23 + 0.06 proj + 0.843 mkt (train < 10/31) -- given the
+# market our projection added almost nothing. mkt = sum of DK weights x each stat's implied
+# mean (its main line + PROP_SD_K * sqrt(line + .5) * z(no-vig P(over))); turnovers and
+# double-double bonuses are absorbed by the blend's intercept. PROPS_BLEND is fitted in
+# scripts/nba_lineup_lab.py (`props-fit`, train dates only); None = off.
+PROP_MARKETS = ["player_points", "player_rebounds", "player_assists", "player_threes",
+                "player_steals", "player_blocks"]
+PROP_DK = {"player_points": 1.0, "player_rebounds": 1.25, "player_assists": 1.5,
+           "player_threes": 0.5, "player_steals": 2.0, "player_blocks": 2.0}
+PROP_REQUIRED = ("player_points", "player_rebounds", "player_assists")
+PROP_SD_K = 1.1            # critic's spread heuristic (a stat's sd ~ 1.1 sqrt(line)); not fitted
+# proj' = a + b proj + c mkt. Fitted 2026-11-08 by scripts/nba_lineup_lab.py on 1,436 prop-covered
+# board players, 16 dates 10/20-11/7 (DK's own points by draft group); the train-only fit
+# (< 10/31, 838 rows) was 5.68 / 0.141 / 0.714. Validated leave-one-date-out through the
+# production optimizer (`props-lodo`, every contest held out): CASH lineups' field percentile
+# .275 -> .541 (+.265 [90% +.111, +.436] by date), cashed 24% -> 65%, 17 contests / 12 dates,
+# 8 dates better / 3 worse; GPP .475 -> .601 (+.126 [-.068, +.332]), 33 contests / 16 dates.
+# Player MAE on test dates 8.72 -> 8.23 (-.49 [-.78, -.12], 598 players / 6 dates).
+PROPS_BLEND: tuple | None = (4.401, 0.139, 0.762)
+
+
+def market_dk(pm: dict) -> float | None:
+    """The market's DK points from one player's main lines, or None without points,
+    rebounds and assists."""
+    from edge import dfs_project as DP
+    if not all(m in pm for m in PROP_REQUIRED):
+        return None
+    tot = 0.0
+    for m, w in PROP_DK.items():
+        mk = pm.get(m)
+        pair = DP._pair(mk) if mk else None
+        if not pair or mk.get("point") is None:
+            continue
+        line = float(mk["point"])
+        tot += w * DP.implied_mean(pair[0], pair[1], line, PROP_SD_K * (line + 0.5) ** 0.5)
+    return round(tot, 2)
+
+
+def market_points(client, rows: list[dict]) -> dict:
+    """{row name: market DK points} for board rows whose own game's event has DK props.
+    A player takes lines only from the event between his team and his opponent (a scan
+    can hold two nights), matched by norm name, else by (last name, first initial) when
+    agreeing first names (nicknames / prefixes, never a bare initial) when exactly one
+    subject of that event fits (DK "Alexandre Sarr" / a book's "Alex Sarr")."""
+    by_event, _ = dfs_slate.player_markets_by_event(client, SPORT, PROP_MARKETS)
+    teams_of = {}
+    for ev in client.get_events(SPORT):
+        h, a = TEAM_NAME_TO_ABBR.get(ev.get("home_team") or ""), TEAM_NAME_TO_ABBR.get(ev.get("away_team") or "")
+        if h and a:
+            teams_of[ev["id"]] = frozenset((h, a))
+    out = {}
+    for r in rows:
+        mine = frozenset((r.get("team"), r.get("opp")))
+        evs = [e for e, t in teams_of.items() if t == mine and e in by_event]
+        if len(evs) != 1:
+            continue
+        subjects = by_event[evs[0]]
+        pm = next((v for k, v in subjects.items() if norm(k) == norm(r["name"])), None)
+        if pm is None:
+            # same surname and first names that agree (nicknames, Alex / Alexandre, GG /
+            # Gregory: edge.names.first_names_agree), exactly one in his game -- never an
+            # initial alone (Adam 11/2: Mike / Malik Williams)
+            alt = [v for k, v in subjects.items() if _sig(k)[0] == _sig(r["name"])[0]
+                   and first_names_agree(k.split()[0], r["name"].split()[0])]
+            pm = alt[0] if len(alt) == 1 else None
+        got = market_dk(pm) if pm else None
+        if got is not None:
+            out[r["name"]] = got
+    return out
+
+
+def blend_props(rows: list[dict], mkt: dict, blend: tuple | None = None) -> int:
+    """proj' = a + b proj + c mkt on every projected row with a market number; the rest
+    keep the model's. Marks r["mkt"] and r["proj_source"]. Returns the count blended."""
+    blend = PROPS_BLEND if blend is None else blend
+    n = 0
+    for r in rows:
+        if not r.get("proj") or r["name"] not in mkt:
+            r.setdefault("proj_source", "model")
+            continue
+        r["mkt"] = mkt[r["name"]]
+        r["model_proj"] = r["proj"]          # logged: the lab replays from the model's number
+        if blend:
+            a, b, c = blend
+            r["proj"] = round(max(0.1, a + b * r["proj"] + c * r["mkt"]), 2)
+            r["proj_source"] = "props"
+            n += 1
+        else:
+            r["proj_source"] = "model"
+    return n
+
+
+def _agree(a: str, b: str) -> bool:
+    """Same surname and first names that could be one person (edge.names.first_names_agree
+    with the one-slip typo rule: every caller joins inside ONE team). The bare (last name,
+    first initial) signature was the test until 2026-11-08; Adam's rule is that an initial
+    alone never names a player (Mike / Malik Williams)."""
+    pa = [w for w in (a or "").replace(".", " . ").split() if w != "."]
+    pb = [w for w in (b or "").replace(".", " . ").split() if w != "."]
+    if _sig(a)[0] != _sig(b)[0] or not pa or not pb:
+        return False
+    fa, fb = (a.split()[0], b.split()[0])
+    return first_names_agree(fa, fb, typo=True)
+
+
 def tonight_status(date: str) -> dict:
     """{(norm name, team): {"starter", "confirmed", "inactive", "id"}} from NBA.com."""
     raw = nba_lineups.tonight(date)
@@ -195,12 +312,12 @@ def tonight_status(date: str) -> dict:
         for p in g["players"]:
             out[(norm(p["name"]), p["team"])] = {"starter": p["starter"], "confirmed": p["confirmed"],
                                                  "inactive": p["inactive"], "id": str(p["id"]),
-                                                 "sig": _sig(p["name"])}
+                                                 "sig": _sig(p["name"]), "name": p["name"]}
     return out
 
 
 def official_index(rows, known: set) -> tuple[dict, dict]:
-    """({norm name: status}, {(last, first initial): [status]}) from the official
+    """({norm name: status}, {(last, first initial): [(report name, status)]}) from the official
     injury report's rows. The initial fallback exists for a name the report and DK
     spell differently (Alex / Alexandre Sarr); the report carries no team, so a
     report name that is itself a known NBA player is never offered to it.
@@ -213,8 +330,71 @@ def official_index(rows, known: set) -> tuple[dict, dict]:
         full = nba_injury_report.full_name(last, first)
         official[norm(full)] = st_
         if norm(full) not in known:
-            official_sig.setdefault(_sig(full), []).append(st_)
+            official_sig.setdefault(_sig(full), []).append((full, st_))
     return official, official_sig
+
+
+def team_minutes(ps: list, official: bool) -> tuple[dict, list, dict]:
+    """One team's minutes from its board rows (build_board's per-team step, split out
+    2026-11-07 so scripts/nba_expected_replay.py runs the SAME code on logged nights):
+    the roster cut (sets r["not_dressing"]), the uncertain set, NM.project_uncertain
+    (sets r["avail"] / r["avail_why"]). `official`: the NBA's injury report was read.
+    Returns (minutes as NM.project, team_in, unc)."""
+    announced = sum(1 for r in ps if r["starter"]) == 5
+    listed = any(r["inactive_listed"] for r in ps)
+    if not listed:
+        # Until NBA.com posts the inactive list (~30 min before tip), DK's ~20-man
+        # list includes players who will not dress. A game-night roster is 13
+        # active and its roles add to ~241 minutes (2025-26 median; 230 opening
+        # week), so keep the 13 most-used and treat the rest as not dressing.
+        # Without this the team was held to 240 over 21 roles summing to 300-360,
+        # and every starter lost a quarter of his minutes.
+        healthy = [r for r in ps if not r["out"]]
+        # NBA.com's announced starters always dress: a rookie on preseason
+        # minutes (or a name the join missed) must not be cut by his role.
+        ranked = sorted(healthy, key=lambda r: (not r["starter"], -NM.role_v2(
+            [(m, s) for m, s, _ in r["history"]], r["cur_n"], r["n_pre"])["base"]))
+        for r in ranked[ACTIVE_ROSTER:]:
+            r["not_dressing"] = True
+    team_in = [{"id": r["name"], "position": r["nba_pos"],
+                "inactive": r["out"] or r.get("not_dressing", False),
+                "starter": r["starter"] if announced else None, "window": r["window"],
+                # NBA.com's Expected five is a guess (wrong in 7 of 28 team-games on
+                # 2026-10-20/21): project() blends it with no five until it's confirmed
+                "confirmed": bool(r["confirmed"]) if announced else None,
+                "history": [(m, s) for m, s, _ in r["history"]], "cur_n": r["cur_n"],
+                "n_pre": r["n_pre"], "since_return": r["since_return"], "pick": r["pick"],
+                "salary": r["salary"]} for r in ps]
+    # Critique cycles 6-7: a kept player who is Doubtful / Questionable / Probable on
+    # the official report, or not listed but sat his team's latest game ("stale"),
+    # may not dress: he gets P(dress) x his minutes, his teammates their expected
+    # minutes over his two cases (NM.project_uncertain). Not an announced starter.
+    unc, by_id = {}, {}
+    for r in ps:
+        if r["out"] or r.get("not_dressing"):
+            continue
+        inj = {"Available": "Probable"}.get(r["injury"], r["injury"])
+        if announced and r["starter"]:
+            # Critique cycle 25: a CONFIRMED starter dresses. An Expected one on the report
+            # may not (see EXPECTED_HEDGE): his P(dress) comes from the no-five table --
+            # whether he starts is still open -- and the sits-case keeps the other four.
+            if r["confirmed"] or not EXPECTED_HEDGE or inj not in ("Doubtful", "Questionable", "Probable"):
+                continue
+            by_id[r["name"]] = NM.REPORT_P["inactives"]
+        if inj in ("Doubtful", "Questionable", "Probable"):
+            unc[r["name"]] = inj
+        elif r["missed_last"]:
+            unc[r["name"]] = "stale"
+    keeps = ({k: {x["name"] for x in [x for x in ranked if x["name"] != k][:ACTIVE_ROSTER]} for k in unc}
+             if unc and not listed else None)
+    mode_ = "confirmed" if announced else "inactives"
+    probs = NM.REPORT_P[mode_] if official else {
+        **NM.REPORT_P[mode_], ("stale", False): NM.AVAIL_P[mode_][0], ("stale", True): NM.AVAIL_P[mode_][1]}
+    mins, avail = NM.project_uncertain(team_in, unc, mode_, keeps, probs, probs_by_id=by_id)
+    for r in ps:
+        if r["name"] in avail:
+            r["avail"], r["avail_why"] = avail[r["name"]], unc[r["name"]]
+    return mins, team_in, unc
 
 
 def build_board(gid: int, meta: dict, client=None) -> tuple[list, dict]:
@@ -234,7 +414,9 @@ def build_board(gid: int, meta: dict, client=None) -> tuple[list, dict]:
     info["injuries_source"] = nba_availability.LAST_SOURCE if espn_rows or date >= datetime.now(ET).date().isoformat() \
         else "past slate (not read)"
     espn_out = {(norm(n), t) for n, t in espn_rows}
-    espn_sig = {(_sig(n), t) for n, t in espn_rows}
+    espn_sig: dict = {}
+    for n, t in espn_rows:
+        espn_sig.setdefault((_sig(n), t), []).append(n)
     # Critique cycle 7: the NBA's official injury report (every 15 min) -- Out, plus
     # Doubtful / Questionable / Probable, two-ways included -- keyed by norm name and,
     # for a name the two spell differently, (last name, first initial) when unique.
@@ -250,7 +432,7 @@ def build_board(gid: int, meta: dict, client=None) -> tuple[list, dict]:
     def report_status(name, sig_ok=True):
         if norm(name) in official:
             return official[norm(name)]
-        alt = official_sig.get(_sig(name), []) if sig_ok else []
+        alt = [st_ for full, st_ in official_sig.get(_sig(name), []) if _agree(full, name)] if sig_ok else []
         return alt[0] if len(alt) == 1 else None
     implied = game_lines(client, games) if client is not None else {}
     league_pm = hist.get("league_pm")
@@ -279,7 +461,8 @@ def build_board(gid: int, meta: dict, client=None) -> tuple[list, dict]:
         # starter left off the board): same team, last name and first initial,
         # and only if exactly one player fits -- never a guess.
         sig = _sig(name)
-        alt = [i for i, hp in hist["players"].items() if hp.get("team") == t and _sig(hp.get("name") or "") == sig]
+        alt = [i for i, hp in hist["players"].items() if hp.get("team") == t and _sig(hp.get("name") or "") == sig
+               and _agree(hp.get("name") or "", name)]
         return alt[0] if len(alt) == 1 else None
 
     def status_of(key, t, name, sig_ok=True):
@@ -288,7 +471,8 @@ def build_board(gid: int, meta: dict, client=None) -> tuple[list, dict]:
         if not sig_ok:
             return {}
         sig = _sig(name)
-        alt = [v for (k2, t2), v in status.items() if t2 == t and v.get("sig") == sig]
+        alt = [v for (k2, t2), v in status.items() if t2 == t and v.get("sig") == sig
+               and _agree(v.get("name") or "", name)]
         return alt[0] if len(alt) == 1 else {}
 
     # The (last name, first initial) fallbacks below may only name a DK player
@@ -312,7 +496,8 @@ def build_board(gid: int, meta: dict, client=None) -> tuple[list, dict]:
         h = hist["players"].get(pid, {}) if pid else {}
         opp = next((team(g["away"]) if team(g["home"]) == t else team(g["home"])
                     for g in games.values() if t in (team(g["home"]), team(g["away"]))), None)
-        espn = (key, t) in espn_out or (sig_ok and (_sig(sal["name"]), t) in espn_sig)
+        espn = (key, t) in espn_out or (sig_ok and any(_agree(n, sal["name"])
+                                                       for n in espn_sig.get((_sig(sal["name"]), t), [])))
         injury = report_status(sal["name"], sig_ok)
         out = bool(st.get("inactive")) or sal.get("dk_status") in ("OUT", "O") or espn or injury == "Out"
         # `start` lets the optimiser put the LATEST tips in G / F / UTIL (DK's
@@ -338,53 +523,8 @@ def build_board(gid: int, meta: dict, client=None) -> tuple[list, dict]:
     for r in rows:
         by_team.setdefault(r["team"], []).append(r)
     for t, ps in by_team.items():
+        mins, team_in, unc = team_minutes(ps, bool(official))
         announced = sum(1 for r in ps if r["starter"]) == 5
-        listed = any(r["inactive_listed"] for r in ps)
-        if not listed:
-            # Until NBA.com posts the inactive list (~30 min before tip), DK's ~20-man
-            # list includes players who will not dress. A game-night roster is 13
-            # active and its roles add to ~241 minutes (2025-26 median; 230 opening
-            # week), so keep the 13 most-used and treat the rest as not dressing.
-            # Without this the team was held to 240 over 21 roles summing to 300-360,
-            # and every starter lost a quarter of his minutes.
-            healthy = [r for r in ps if not r["out"]]
-            # NBA.com's announced starters always dress: a rookie on preseason
-            # minutes (or a name the join missed) must not be cut by his role.
-            ranked = sorted(healthy, key=lambda r: (not r["starter"], -NM.role_v2(
-                [(m, s) for m, s, _ in r["history"]], r["cur_n"], r["n_pre"])["base"]))
-            for r in ranked[ACTIVE_ROSTER:]:
-                r["not_dressing"] = True
-        team_in = [{"id": r["name"], "position": r["nba_pos"],
-                    "inactive": r["out"] or r.get("not_dressing", False),
-                    "starter": r["starter"] if announced else None, "window": r["window"],
-                    # NBA.com's Expected five is a guess (wrong in 7 of 28 team-games on
-                    # 2026-10-20/21): project() blends it with no five until it's confirmed
-                    "confirmed": bool(r["confirmed"]) if announced else None,
-                    "history": [(m, s) for m, s, _ in r["history"]], "cur_n": r["cur_n"],
-                    "n_pre": r["n_pre"], "since_return": r["since_return"], "pick": r["pick"],
-                    "salary": r["salary"]} for r in ps]
-        # Critique cycles 6-7: a kept player who is Doubtful / Questionable / Probable on
-        # the official report, or not listed but sat his team's latest game ("stale"),
-        # may not dress: he gets P(dress) x his minutes, his teammates their expected
-        # minutes over his two cases (NM.project_uncertain). Not an announced starter.
-        unc = {}
-        for r in ps:
-            if r["out"] or r.get("not_dressing") or (announced and r["starter"]):
-                continue
-            inj = {"Available": "Probable"}.get(r["injury"], r["injury"])
-            if inj in ("Doubtful", "Questionable", "Probable"):
-                unc[r["name"]] = inj
-            elif r["missed_last"]:
-                unc[r["name"]] = "stale"
-        keeps = ({k: {x["name"] for x in [x for x in ranked if x["name"] != k][:ACTIVE_ROSTER]} for k in unc}
-                 if unc and not listed else None)
-        mode_ = "confirmed" if announced else "inactives"
-        probs = NM.REPORT_P[mode_] if official else {
-            **NM.REPORT_P[mode_], ("stale", False): NM.AVAIL_P[mode_][0], ("stale", True): NM.AVAIL_P[mode_][1]}
-        mins, avail = NM.project_uncertain(team_in, unc, mode_, keeps, probs)
-        for r in ps:
-            if r["name"] in avail:
-                r["avail"], r["avail_why"] = avail[r["name"]], unc[r["name"]]
         if unc:
             info.setdefault("uncertain", []).extend(f"{k} ({v})" for k, v in sorted(unc.items()))
         # "Usual" = the same team with no news: everyone healthy who dresses, no
@@ -418,6 +558,15 @@ def build_board(gid: int, meta: dict, client=None) -> tuple[list, dict]:
                 r["proj"] = r["usual"] = round(r["salary"] / 1000.0 * IMPUTED_PER_K, 2)
                 r["imputed"].append("no NBA history")
                 info["imputed"].append(r["name"])
+    # DK props (critique cycle 27): the market's DK points, blended where posted
+    if client is not None:
+        try:
+            mkt = market_points(client, [r for r in rows if not r["out"] and r.get("proj")])
+        except Exception as exc:                            # noqa: BLE001 -- props are optional
+            log.warning("nba: no props (%s)", exc)
+            mkt = {}
+        info["props_blended"] = blend_props([r for r in rows if not r["out"]], mkt)
+        info["props_players"] = len(mkt)
     # Every priced player's salary / position / tip, so a late swap can hold the
     # slot of an entered player who is OUT but already locked (late_swap below).
     info["priced_rows"] = {r["name"]: {"salary": r["salary"], "dk_pos": r["dk_pos"], "team": r["team"],
@@ -499,7 +648,10 @@ def late_swap(pool: list, sim, entered: list[str], priced: dict, mode: str = "gp
 
 
 PROJ_LOG_COLS = ("date", "gid", "player", "team", "opp", "dk_pos", "salary", "minutes", "proj",
-                 "sd", "floor", "ceil", "own", "promoted", "lineup", "imputed", "source", "starter", "recent")
+                 "sd", "floor", "ceil", "own", "promoted", "lineup", "imputed", "source", "starter", "recent",
+                 # critique cycle 27: the projection before the props blend + the market's DK points,
+                 # so a replay never blends a logged (already blended) proj twice
+                 "model_proj", "mkt", "proj_source")
 
 
 def optimal_columns(pool: list, sim, nights: int | None = None) -> dict:
@@ -535,7 +687,9 @@ def log_forward_test(pool, cash, gpp, gid, info, root: Path | None = None,
              "source": "live",
              # ownership inputs (SLATE_OWN, CHEAP_STARTER) so the lab replays them
              "starter": int(bool(p.get("starter"))),
-             "recent": "" if p.get("recent") is None else round(p["recent"], 2)} for p in pool]
+             "recent": "" if p.get("recent") is None else round(p["recent"], 2),
+             "model_proj": p.get("model_proj", ""), "mkt": p.get("mkt", ""),
+             "proj_source": p.get("proj_source", "")} for p in pool]
     lineups = [{"mode": mode, "slot": slot, "player": p["name"], "team": p["team"],
                 "salary": p["salary"], "proj": p["proj"], "own": p.get("own")}
                for mode, res in (("cash", cash), ("gpp", gpp))
